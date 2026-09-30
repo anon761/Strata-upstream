@@ -1103,6 +1103,12 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         if (lay.gguf_file.empty() || lay.gguf_file[(size_t) l].empty()) return gguf;
         return dir + lay.gguf_file[(size_t) l];
     };
+    // v4: a single layer's gate/up/down may sit in different shards; empty role entries fall back to the layer.
+    auto file_of_role = [&](int64_t l, int r) -> std::string {
+        if (!lay.gguf_file_role.empty() && !lay.gguf_file_role[(size_t) (3 * l + r)].empty())
+            return dir + lay.gguf_file_role[(size_t) (3 * l + r)];
+        return file_of(l);
+    };
     auto worker = [&]() {
         std::ifstream f;
         std::string open_name;
@@ -1110,19 +1116,19 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
         for (;;) {
             const int64_t l = next.fetch_add(1);
             if (l >= lay.n_layers || bad) break;
-            const std::string name = file_of(l);
-            if (name != open_name) {
-                f.close();
-                f.clear();
-                f.open(name, std::ios::binary);
-                if (!f) { bad = true; return; }
-                open_name = name;
-            }
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
             const uint64_t at[3] = {0, fm.up_off, fm.down_off};
             for (int r = 0; r < 3; ++r) {
+                const std::string name = file_of_role(l, r);
+                if (name != open_name) {
+                    f.close();
+                    f.clear();
+                    f.open(name, std::ios::binary);
+                    if (!f) { bad = true; return; }
+                    open_name = name;
+                }
                 const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
                 const uint64_t total = per[r] * (uint64_t) lay.n_expert;
                 const uint64_t chunk = per[r] * 16;           // 16 experts per read

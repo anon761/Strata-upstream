@@ -126,6 +126,14 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             if (ss >> file) {
                 if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
                 L.gguf_file[(size_t) l] = file;
+                // v4: three names (gate, up, down) when one layer's roles live in different shards
+                std::string up_file, down_file;
+                if (ss >> up_file >> down_file) {
+                    if (L.gguf_file_role.empty()) L.gguf_file_role.assign((size_t) (3 * n_layers), std::string());
+                    L.gguf_file_role[(size_t) (3 * l)] = file;
+                    L.gguf_file_role[(size_t) (3 * l + 1)] = up_file;
+                    L.gguf_file_role[(size_t) (3 * l + 2)] = down_file;
+                }
             }
         }
         L.fmt[(size_t) l] = f;
