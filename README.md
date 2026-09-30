@@ -1,4 +1,94 @@
-<h1 align="center">Strata</h1>
+# vllm-arcfork
+
+> **A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** (MIT), pinned at upstream `v0.1.28`.
+> This fork is not affiliated with or endorsed by the Strata authors. Upstream's README is kept verbatim at the
+> bottom; the engine, its design and its documentation are upstream's work.
+
+## What this is
+
+`vllm-arcfork` is an internal fork of the **Strata** inference engine. Strata upstream is a specialised,
+high-performance engine for *one* model - **Qwen3.8-Flash-Next** - and ships it through ISTA-DASLab's
+**GSQ-RCO** pack (2-3.5 bit i-quants: `Q2_0`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`).
+
+This fork generalises the engine to run **ordinary GGUF quantizations** - the files people actually download,
+e.g. unsloth's `UD-Q4_K_XL` (`Q4_K`/`Q5_K` gate/up, `Q5_1`/`Q8_0` down, `Q8_0` embeddings) - on the GPU, and fixes
+the producer-specific integration gaps those files expose. The reference target is **q4** on a 2x RTX 3090 box.
+
+It is meant to be driven from `mayaservices` as the GGUF backend, next to stock vLLM for safetensors models.
+
+## What the fork adds
+
+- **General GGUF input** for the artifact layer: a layer's gate/up and down may live in **different shards**
+  (`native_experts.txt` v4, per-role shard names), `token_embd`/`output` may be `Q8_0`, and the head/embedding are
+  found across every model shard.
+- **K-quant / Q5_1 / Q8_0 experts on the GPU**: grouped decode vec-dots for `Q4_K`/`Q5_K`/`Q6_K`/`Q5_1`/`Q8_0`,
+  the matching FP16 prefill dequantizers (matching ggml's value order), and the llama.cpp **MMQ** template
+  instances for the K-quants.
+- **`tools/iq_pack.py`**: writes the PLE conv weight (`blk.1.ple_conv1d.weight`) as **F16** - ordinary GGUFs ship
+  it `F32`/`BF16`, which the PLE kernel mis-read and turned the output into gibberish - and emits v4 per-role
+  expert shards. (`--compat-bf16`, `--down-q8` are fork switches.)
+- **Linux prefill fix**: pin the **whole expert arena** (upstream caps CUDA registration at 8 GiB, a
+  Windows/WDDM workaround that needlessly applied on Linux) and size the streaming ring by blob size. On 2x RTX
+  3090 this lifts unsloth `UD-Q4_K_XL` prefill from ~400 to ~890 tok/s.
+- **Parity tests** for the ordinary-quant expert paths: `native_expert_parity` (grouped decode vs ggml, plus the
+  FP16 dequant and the engine's own arena loader) and `moe_mmq_parity` (prefill MMQ and `native_mmvq` vs ggml).
+- `setup.py` prefers the pip-installed `cmake`/`ninja` (a distro cmake is too old for the CUDA 20 dialect).
+
+## Measured results
+
+2x **RTX 3090** (24 GB each), AMD EPYC 7413, **450 GB** RAM, driver 580, CUDA 13.3, layer split across both cards,
+32K context. Single request, OpenAI `/v1/chat/completions`; prefill on a ~2,067-token prompt, decode on 128-256
+output tokens (decode excludes time-to-first-token).
+
+| Model (GGUF) | Experts | Prefill tok/s | Decode tok/s | Notes |
+| --- | --- | ---: | ---: | --- |
+| **unsloth `UD-Q4_K_XL`** (103.7 GiB) | Q4_K/Q5_K gate/up, Q5_1/Q8_0 down | **~890** | **~79** | K=26/28 split, ~97% of the routed mass cached, MTP acceptance ~68% |
+| unsloth `UD-Q4_K_XL`, before the arena-pin fix | same | ~400 | ~72 | the 8 GiB registration cap left most experts unregistered |
+| ISTA-DASLab `GSQ-RCO IQ2_XS` (upstream pack, 68 GiB) | IQ2_XS / Q2_0 | ~2480 | ~88 | smaller experts, ~100% cached |
+
+For context on the same box: **stock vLLM** with a 4-bit safetensors model (Swift 1.5 W4A16, 116 GB) does not fit
+48 GB VRAM; with ~30 GB of experts offloaded to host RAM it reaches only ~290 tok/s prefill / ~12.7 tok/s decode.
+llama.cpp (qwen4exp build, two-band offload) is ~13-14 tok/s decode. So on 2x 3090 the fork is the fastest of the
+three for this model.
+
+## Building and running
+
+```bash
+git clone <this fork> && cd vllm-arcfork
+./setup.sh --build --model IQ2_XS --gpus 0,1   # source build (sm_86) + an upstream pack, or:
+```
+
+For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and point the server at it:
+
+```bash
+# 1) build the native pack (reads every shard; --compat-bf16 dequantizes the small projections)
+.venv/bin/python tools/iq_pack.py --gguf <shard1.gguf> --out /path/to/pack --compat-bf16
+# 2) a run config (see serve/server.py --help) with:
+#    --pack <pack> --native <shard1> --native-head-gguf <shard with output.weight> --ple-gguf <shard with PLE>
+#    --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --mtp <mtp dir>
+#    --max-context 32768 --kv int8   and  "gpu": [0,1], "layer_split": "auto"
+```
+
+Requirements are upstream's: an NVIDIA RTX 20+ card, a current driver, and (for a source build) a CUDA toolkit
+with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
+
+## Known issues / limitations
+
+- **`Q5_1`'s MMQ case faults** (an illegal memory access) at the pinned llama.cpp commit on sm_86. The fork
+  therefore leaves `Q5_1` out of `mmq::supported` and routes `Q5_1`-down layers through the **FP16 dequant** path
+  (correct, and here faster than MMQ-with-`Q8_0`-down, which streams larger blobs).
+- **Single GPU in an LXC** can fail `cublasCreate` when the expert cache fills VRAM (container pinning limits).
+  The 2-GPU layer split is the supported configuration.
+- The upstream `--expert-cache-per-layer` policy aborts on native packs with mixed blob sizes; not used here.
+
+## License and attribution
+
+MIT, upstream's [`LICENSE`](LICENSE) unchanged. The engine, the kernels, the MMQ path (llama.cpp, MIT), the model
+and the packs are upstream's and their authors' work - see the upstream README below and `LICENSE`.
+
+---
+
+<h2 align="center">Strata</h2>
 
 <p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
 one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
