@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -44,6 +45,9 @@ public:
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
     bool load(const std::string& gguf, int64_t n_embd, int64_t n_vocab, std::string& err);
+    /// v4: search every candidate shard (a split may keep token_embd in another shard than --native) and load
+    /// the table from the first that holds `token_embd.weight` in a supported form.
+    bool load_any(const std::vector<std::string>& paths, int64_t n_embd, int64_t n_vocab, std::string& err);
     /// Rows for device token ids.
     void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
     /// One row for a host token id.

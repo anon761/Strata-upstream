@@ -23,8 +23,13 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
     }
     try {
         strata::GgufFile gguf(path);
-        err = strata::check_architecture(gguf);
-        if (!err.empty()) return false;
+        const std::string arch_err = strata::check_architecture(gguf);
+        // a split's later shards may omit general.architecture (only shard 1 carries the full metadata);
+        // a present-but-wrong architecture is still fatal.
+        if (!arch_err.empty() && arch_err.find("missing general.architecture") == std::string::npos) {
+            err = arch_err;
+            return false;
+        }
         const strata::TensorInfo* tensor = nullptr;
         for (const auto& candidate : gguf.tensors()) {
             if (candidate.name != "output.weight") continue;
@@ -138,6 +143,24 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         err = std::string("native embedding: ") + e.what();
         return false;
     }
+}
+
+bool NativeEmbed::load_any(const std::vector<std::string>& paths, int64_t n_embd, int64_t n_vocab, std::string& err) {
+    for (const auto& path : paths) {
+        if (path.empty()) continue;
+        try {
+            strata::GgufFile probe(path);
+            const strata::TensorInfo* t = nullptr;
+            for (const auto& c : probe.tensors())
+                if (c.name == "token_embd.weight") t = &c;
+            if (t == nullptr || !strata::kernels::iq_supported((int) t->type)) continue;
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (load(path, n_embd, n_vocab, err)) return true;
+    }
+    err = "native embedding: token_embd.weight was not found in any model shard in a supported form";
+    return false;
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {

@@ -1371,7 +1371,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+        std::vector<std::string> embed_paths = o.native_dense_gguf;
+        embed_paths.push_back(o.native_preset);
+        if (!o.ple_gguf.empty()) embed_paths.push_back(o.ple_gguf);
+        if (!native_embed.load_any(embed_paths, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
