@@ -78,6 +78,13 @@ def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
     return quants.quantize(values, Q.BF16).tobytes()
 
 
+def f16_bytes(raw: np.ndarray, type_name: str) -> bytes:
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import GGMLQuantizationType as Q, quants
+    return quants.quantize(quants.dequantize(raw, Q[type_name]), Q.F16).tobytes()
+
+
 class Model:
     """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path)."""
 
@@ -133,7 +140,7 @@ def is_expert(name: str) -> bool:
     return name.startswith("blk.") and name.endswith(("_exps.weight",))
 
 
-def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
+def index_standalone(src, out, model: Model, compat_bf16: bool = False, all_dense: bool = False) -> int:
     """Every non-expert tensor of the model: floats into dense.bin as stored (exact-BF16 F32 routers as BF16),
     quantized ones native-only."""
     if not compat_bf16:
@@ -154,16 +161,22 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
                 return 1
             ne0 = int(t.shape[0])
             ne1 = int(t.shape[1]) if len(t.shape) > 1 else 0
-            convert = compat_bf16 and needs_bf16(t.name, t.type_name) and t.type_name != "BF16"
-            if t.type_name in FLOAT or convert:
+            convert = compat_bf16 and (all_dense or needs_bf16(t.name, t.type_name)) and t.type_name != "BF16" \
+                and t.name not in ("token_embd.weight", "output.weight")
+            # the PLE conv weight is read as F16 by the engine (kernels/ple.hpp); ordinary GGUFs ship it F32/BF16
+            force_f16 = t.name.endswith("ple_conv1d.weight") and t.type_name != "F16"
+            if t.type_name in FLOAT or convert or force_f16:
                 raw = tensor_bytes(mm, g, t).tobytes()
-                if convert:
+                if force_f16:
+                    raw = f16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
+                    kind = "5"
+                elif convert:
                     raw = bf16_bytes(np.frombuffer(raw, dtype=np.uint8), t.type_name)
                     kind = "4"
                     converted.append({"name": t.name, "source_type": t.type_name, "bytes": len(raw)})
                 else:
                     kind = {"BF16": "4", "F16": "5", "F32": "2"}[t.type_name]
-                if not convert and t.type_name == "F32" and t.name.endswith(ROUTERS):
+                if not convert and not force_f16 and t.type_name == "F32" and t.name.endswith(ROUTERS):
                     u = np.frombuffer(raw, dtype=np.uint32)
                     if np.count_nonzero(u & 0xFFFF):
                         print("router %s is F32 with values that are not BF16; the engine's router is BF16" % t.name)
@@ -262,10 +275,13 @@ def main() -> int:
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
+    ap.add_argument("--compat-bf16-all", action="store_true",
+                    help="fork: dequantize EVERY non-expert quantized tensor to BF16 (dense then loads "
+                         "canonically, no native MMVQ); for the ordinary-GGUF isolation A/B")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
-    if a.compat_bf16 and a.base:
+    if (a.compat_bf16 or a.compat_bf16_all) and a.base:
         ap.error("--compat-bf16 cannot reuse --base dense weights")
     # HF snapshot files are symlinks to hash-named blobs. Keep the shard filename for discovery.
     src = pathlib.Path(a.gguf).absolute()
@@ -285,7 +301,7 @@ def main() -> int:
             return 1
         rc = index_from_base(a, src, base, out, g, {t.name: t for t in g.tensors}, mm)
     else:
-        rc = index_standalone(src, out, model, a.compat_bf16)
+        rc = index_standalone(src, out, model, a.compat_bf16 or a.compat_bf16_all, a.compat_bf16_all)
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
