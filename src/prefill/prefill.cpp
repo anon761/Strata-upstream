@@ -81,7 +81,19 @@ double g_pinned_share = 1.0;
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
-    const int r = v ? std::atoi(v) : (g_pinned_share >= 0.9 ? 384 : 96);
+    int r;
+    if (v) {
+        r = std::atoi(v);
+    } else if (g_pinned_share >= 0.9) {
+        // A fully pinned arena makes every streamed expert a direct DMA, so a large ring pays off - but each
+        // slot holds one blob in VRAM, and ordinary (larger) quants must not push the prompt buffers out.
+        // 384 is the tuned value for the small Q2_0/i-quant blobs; scale it down by the blob size.
+        const uint64_t blob = strata::kernels::cpu::expert_layout().max_blob;
+        const uint64_t budget = 512ull << 20;
+        r = (int) std::min<int64_t>(384, std::max<int64_t>(16, (int64_t) (budget / (blob ? blob : 1))));
+    } else {
+        r = 96;
+    }
     const int big = r < 16 ? 16 : r > RING_MAX ? RING_MAX : r;
     return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
 }
