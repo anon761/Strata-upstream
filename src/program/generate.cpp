@@ -267,6 +267,8 @@ struct Options {
     bool stop_eos = false;
     std::vector<int64_t> eos_ids = {248044, 248046};
     bool spec_split = false;   ///< opt-in split verify window (the overlap study: exact, ~7% slower)
+    bool no_spec = false;      ///< fork: run the verifier with no MTP drafts (the Q4 isolation A/B)
+    bool no_native_dense = false;  ///< fork: load the eligible projections canonically (BF16) instead of native MMVQ
     /// --serve, multi-GPU layer split: "K" or "K1,K2,.." (the first layer of each later stage) or "auto" (placed
     /// from each GPU's free VRAM); empty = one GPU
     std::string layer_split;
@@ -1004,6 +1006,8 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--no-spec") o.no_spec = true;
+        else if (a == "--no-native-dense") o.no_native_dense = true;
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -1388,7 +1392,7 @@ int main(int argc, char** argv) {
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
     std::set<std::string> skip;
     if (!o.keep_canonical) {
-        if (!o.native_dense_gguf.empty() &&
+        if (!o.no_native_dense && !o.native_dense_gguf.empty() &&
             !strata::core::NativeDense::served_names(o.native_dense_gguf, o.native_ple_key, skip, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -1419,7 +1423,7 @@ int main(int argc, char** argv) {
                  (unsigned long long) (pool_bytes >> 20), o.pack.c_str(), skip.size());
 
     strata::core::NativeDense native_dense;
-    if (!o.native_dense_gguf.empty()) {
+    if (!o.no_native_dense && !o.native_dense_gguf.empty()) {
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
@@ -1663,7 +1667,7 @@ int main(int argc, char** argv) {
                          err.empty() ? "the weight arena does not fit" : err.c_str());
             return 1;
         }
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!o.no_native_dense && !o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return 1;
@@ -4690,7 +4694,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        const bool use_mtp = !o.mtp.empty();
+        const bool use_mtp = !o.mtp.empty() && !o.no_spec;
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;

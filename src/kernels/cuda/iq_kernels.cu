@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels {
 namespace {
@@ -312,6 +313,174 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
 
+// ---------------------------------------------------------------- ordinary GGUF quants
+// The grouped expert kernels were i-quant only; an ordinary quant file stores the experts as Q4_K/Q5_K/Q6_K
+// (gate/up) and Q5_1 (the 640-wide down, where a 256-value block does not divide). These are the same
+// llama.cpp vec_dot formulas (MIT) as src/kernels/cuda/native_mmvq.cu, on the ggml block structs.
+__device__ __forceinline__ float vec_dot_q4_K_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q4_K* bq4 = (const block_q4_K*) v + kbx;
+    int vv[2], u[4];
+    float d8[2];
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int* q4 = (const int*) (bq4->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    vv[0] = q4[0];
+    vv[1] = q4[4];
+    const uint16_t* scales = (const uint16_t*) bq4->scales;
+    const int j = bq8_offset / 2, jm = j & 1;
+    const uint32_t s0 = scales[jm], s2 = scales[jm + 2], s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t* sc = (const uint8_t*) aux;
+    const uint8_t* m = sc + 2;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const block_q8_1* bq8i = bq8 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i] = q8[0];
+        u[2 * i + 1] = q8[4];
+    }
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v0i = (vv[0] >> (4 * i)) & 0x0f0f0f0f;
+        const int v1i = (vv[1] >> (4 * i)) & 0x0f0f0f0f;
+        const int dot1 = __dp4a(v1i, u[2 * i + 1], __dp4a(v0i, u[2 * i], 0));
+        const int dot2 = __dp4a(0x01010101, u[2 * i + 1], __dp4a(0x01010101, u[2 * i], 0));
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+    const float2 dm = __half22float2(bq4->dm);
+    return dm.x * sumf_d - dm.y * sumf_m;
+}
+
+__device__ __forceinline__ float vec_dot_q5_K_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q5_K* bq5 = (const block_q5_K*) v + kbx;
+    int vl[2], vh[2], u[4];
+    float d8[2];
+    const int bq8_offset = 2 * ((iqs / 2) / 4);
+    const int* ql = (const int*) (bq5->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+    const int* qh = (const int*) (bq5->qh + 4 * ((iqs / 2) % 4));
+    vl[0] = ql[0];
+    vl[1] = ql[4];
+    vh[0] = qh[0] >> bq8_offset;
+    vh[1] = qh[4] >> bq8_offset;
+    const uint16_t* scales = (const uint16_t*) bq5->scales;
+    const int j = bq8_offset / 2, jm = j & 1;
+    const uint32_t s0 = scales[jm], s2 = scales[jm + 2], s4 = scales[jm + 4];
+    const uint32_t hi = (uint32_t) -(int32_t) (j >= 2);
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t* sc = (const uint8_t*) aux;
+    const uint8_t* m = sc + 2;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const block_q8_1* bq8i = bq8 + bq8_offset + i;
+        d8[i] = __low2float(bq8i->ds);
+        const int* q8 = (const int*) bq8i->qs + ((iqs / 2) % 4);
+        u[2 * i] = q8[0];
+        u[2 * i + 1] = q8[4];
+    }
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vl0i = (vl[0] >> (4 * i)) & 0x0f0f0f0f;
+        const int vl1i = (vl[1] >> (4 * i)) & 0x0f0f0f0f;
+        const int vh0i = ((vh[0] >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
+        const int v0i = vl0i | vh0i, v1i = vl1i | vh1i;
+        const int dot1 = __dp4a(v0i, u[2 * i], __dp4a(v1i, u[2 * i + 1], 0));
+        const int dot2 = __dp4a(0x01010101, u[2 * i], __dp4a(0x01010101, u[2 * i + 1], 0));
+        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_m += d8[i] * (dot2 * m[i]);
+    }
+    const float2 dm = __half22float2(bq5->dm);
+    return dm.x * sumf_d - dm.y * sumf_m;
+}
+
+__device__ __forceinline__ float vec_dot_q6_K_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q6_K* bq6 = (const block_q6_K*) v + kbx;
+    const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift = 2 * ((iqs % 16) / 8);
+    const int vl = get_int_b2(bq6->ql, iqs);
+    const int vh = get_int_b2(bq6->qh, 8 * (iqs / 16) + iqs % 8) >> vh_shift;
+    int u[2];
+    float d8[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        u[i] = ((const int*) bq8[bq8_offset + 2 * i].qs)[iqs % 8];
+        d8[i] = __low2float(bq8[bq8_offset + 2 * i].ds);
+    }
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int sc = bq6->scales[scale_offset + 4 * i];
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi = __vsubss4(vil | vih, 0x20202020);
+        sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc);
+    }
+    return __half2float(bq6->d) * sumf;
+}
+
+__device__ __forceinline__ float vec_dot_q5_1_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q5_1* bq5 = (const block_q5_1*) v + kbx;
+    int vl[2], vh[2], u[4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        vl[i] = get_int_b4(bq5->qs, iqs + i);
+        vh[i] = get_int_b4(bq5->qh, 0) >> (4 * (iqs + i));
+        u[2 * i] = get_int_b4(bq8->qs, iqs + i);
+        u[2 * i + 1] = get_int_b4(bq8->qs, iqs + i + 4);   // QI5_1 = 4
+    }
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        int vi0 = (vl[i] >> 0) & 0x0F0F0F0F;
+        vi0 |= (vh[i] << 4) & 0x00000010;
+        vi0 |= (vh[i] << 11) & 0x00001000;
+        vi0 |= (vh[i] << 18) & 0x00100000;
+        vi0 |= (vh[i] << 25) & 0x10000000;
+        sumi = __dp4a(vi0, u[2 * i + 0], sumi);
+        int vi1 = (vl[i] >> 4) & 0x0F0F0F0F;
+        vi1 |= (vh[i] >> 12) & 0x00000010;
+        vi1 |= (vh[i] >> 5) & 0x00001000;
+        vi1 |= (vh[i] << 2) & 0x00100000;
+        vi1 |= (vh[i] << 9) & 0x10000000;
+        sumi = __dp4a(vi1, u[2 * i + 1], sumi);
+    }
+    const float2 dm = __half22float2(bq5->dm);
+    const float2 ds = __half22float2(bq8->ds);
+    return sumi * (dm.x * ds.x) + (dm.y * ds.y) / 2.0f;   // QI5_1 / vdr = 2
+}
+
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q8_0* w = (const block_q8_0*) v + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vv = get_int_b2(w->qs, iqs + i);
+        const int uu = ((const int*) bq8->qs)[iqs + i];
+        sumi = __dp4a(vv, uu, sumi);
+    }
+    return __half2float(w->d) * __low2float(bq8->ds) * float(sumi);
+}
+
+template<> struct Fmt<7> { static constexpr int qk = 32, ipb = 2, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_1_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 4, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<12> { static constexpr int qk = 256, ipb = 16, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<13> { static constexpr int qk = 256, ipb = 16, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<14> { static constexpr int qk = 256, ipb = 32, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q6_K_q8_1(v, y, kbx, iqs); } };
+
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -528,8 +697,94 @@ __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const int64_t il = tid / 8, ib = tid % 8;
     dst_t* y = yy + 32 * ib + 4 * il;
     const float d = (float) x[ib].d;
-    for (int j = 0; j < 4; ++j) y[j] = cvt<dst_t>(d * (float) x[ib].qs[4 * il + j]);
+    for (int j = 0; j < 4; ++j) {
+        y[j] = cvt<dst_t>(d * (float) x[ib].qs[4 * il + j]);
+        y[j + 16] = cvt<dst_t>(d * (float) x[ib].qs[4 * il + 16 + j]);
+    }
 }
+// Ordinary GGUF quants (llama.cpp's dequantize.cuh, MIT): the FP16 fallback for the prefill path when MMQ is not
+// used for a layer (a Q5_1 down matrix, whose MMQ reads back zeros here).
+template<typename dst_t>
+__device__ void dq_q4_K(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q4_K* x = (const block_q4_K*) vx + ibs;
+    const int64_t il = tid / 8, ir = tid % 8, is = 2 * il;
+    dst_t* y = yy + 64 * il + 4 * ir;
+    const float dall = __low2half(x->dm), dmin = __high2half(x->dm);
+    const uint8_t* q = x->qs + 32 * il + 4 * ir;
+    const uint8_t* sc = x->scales;
+    auto gsm = [&](int j, uint8_t& d, uint8_t& m) {
+        if (j < 4) { d = sc[j] & 63; m = sc[j + 4] & 63; }
+        else { d = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+    };
+    uint8_t s0, m0, s1, m1;
+    gsm((int) is, s0, m0);
+    gsm((int) is + 1, s1, m1);
+    const float d1 = dall * s0, f1 = dmin * m0, d2 = dall * s1, f2 = dmin * m1;
+    for (int l = 0; l < 4; ++l) {
+        y[l] = cvt<dst_t>(d1 * (q[l] & 0xF) - f1);
+        y[l + 32] = cvt<dst_t>(d2 * (q[l] >> 4) - f2);
+    }
+}
+template<typename dst_t>
+__device__ void dq_q5_K(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q5_K* x = (const block_q5_K*) vx + ibs;
+    for (int tt = tid; tt < 64; tt += 32) {
+        const int64_t il = tt / 16, ir = tt % 16, is = 2 * il;
+        dst_t* y = yy + 64 * il + 2 * ir;
+        const float dall = __low2half(x->dm), dmin = __high2half(x->dm);
+        const uint8_t* ql = x->qs + 32 * il + 2 * ir;
+        const uint8_t* qh = x->qh + 2 * ir;
+        const uint8_t* sc = x->scales;
+        auto gsm = [&](int j, uint8_t& d, uint8_t& m) {
+            if (j < 4) { d = sc[j] & 63; m = sc[j + 4] & 63; }
+            else { d = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
+        };
+        uint8_t s0, m0, s1, m1;
+        gsm((int) is, s0, m0);
+        gsm((int) is + 1, s1, m1);
+        const float d1 = dall * s0, f1 = dmin * m0, d2 = dall * s1, f2 = dmin * m1;
+        uint8_t hm = 1 << (2 * il);
+        y[0] = cvt<dst_t>(d1 * ((ql[0] & 0xF) + (qh[0] & hm ? 16 : 0)) - f1);
+        y[1] = cvt<dst_t>(d1 * ((ql[1] & 0xF) + (qh[1] & hm ? 16 : 0)) - f1);
+        hm <<= 1;
+        y[32] = cvt<dst_t>(d2 * ((ql[0] >> 4) + (qh[0] & hm ? 16 : 0)) - f2);
+        y[33] = cvt<dst_t>(d2 * ((ql[1] >> 4) + (qh[1] & hm ? 16 : 0)) - f2);
+    }
+}
+template<typename dst_t>
+__device__ void dq_q6_K(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q6_K* x = (const block_q6_K*) vx + ibs;
+    for (int tt = tid; tt < 64; tt += 32) {
+        const int64_t ip = tt / 32, il = tt - 32 * ip, is = 8 * ip + il / 16;
+        dst_t* y = yy + 128 * ip + il;
+        const float d = __half2float(x->d);
+        const uint8_t* ql = x->ql + 64 * ip + il;
+        const uint8_t qh = x->qh[32 * ip + il];
+        const int8_t* sc = x->scales + is;
+        y[0] = cvt<dst_t>(d * sc[0] * ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32));
+        y[32] = cvt<dst_t>(d * sc[2] * ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32));
+        y[64] = cvt<dst_t>(d * sc[4] * ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32));
+        y[96] = cvt<dst_t>(d * sc[6] * ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32));
+    }
+}
+template<typename dst_t>
+__device__ void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q5_1* x = (const block_q5_1*) vx + ibs * (QK_K / QK5_1);
+    const int64_t il = tid / 4, part = tid % 4;
+    const float d = __low2float(x[il].dm), m = __high2float(x[il].dm);
+    uint32_t qh;
+    memcpy(&qh, x[il].qh, 4);
+    dst_t* y = yy + il * 32 + part * 8;
+    for (int j = 0; j < 8; ++j) {
+        // ggml's order: values 0..15 are the low nibbles of qs[0..15], 16..31 the high nibbles
+        const int idx = (int) (part * 8 + j);
+        const int byte = idx % 16;
+        const int lo = (idx < 16) ? (x[il].qs[byte] & 0xF) : (x[il].qs[byte] >> 4);
+        const int hi = (qh >> (byte + (idx < 16 ? 0 : 16))) & 1;
+        y[j] = cvt<dst_t>(d * (float) (lo | (hi << 4)) + m);
+    }
+}
+
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -590,6 +845,10 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
+        case 12: dq_q4_K(vx, ibs, y, tid); break;
+        case 13: dq_q5_K(vx, ibs, y, tid); break;
+        case 14: dq_q6_K(vx, ibs, y, tid); break;
+        case 7: dq_q5_1(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         default: break;
     }
@@ -610,7 +869,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
     dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x);
 }
 
-bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 || t == 8; }
+bool is_iq(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 || t == 8 || t == 7 || t == 12 || t == 13 || t == 14; }
 
 }  // namespace
 
@@ -629,6 +888,10 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 23: return (size_t) (n / 256) * sizeof(block_iq4_xs);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
+        case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
+        case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
+        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
         default: return 0;
     }
 }
@@ -739,6 +1002,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 23: native_gu_kernel<23><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 29: native_gu_kernel<29><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 42: native_gu_kernel<42><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 12: native_gu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 13: native_gu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 14: native_gu_kernel<14><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 8: native_gu_kernel<8><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
     }
     check("native_expert_grouped/gu");
@@ -750,6 +1017,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 7: native_down_kernel<7><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
