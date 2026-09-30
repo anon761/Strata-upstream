@@ -22,6 +22,9 @@ SENTENCE = (
     "is only a fraction of it per token. "
 )
 
+# Measured on the Qwen3.8-Flash-Next tokenizer: the sentence above is ~36 tokens.
+TOKENS_PER_SENTENCE = 36
+
 
 def post_json(url, payload, timeout):
     req = urllib.request.Request(
@@ -36,10 +39,16 @@ def get_json(url, timeout):
         return json.load(r)
 
 
-def make_prompt(target_tokens):
-    # ~11 tokens per sentence on the Qwen tokenizer; good enough to set the length.
-    repeat = max(1, target_tokens // 11)
-    return SENTENCE * repeat + "\nSummarize the above in one short sentence."
+def make_prompt(target_tokens, run_id):
+    # A unique marker first, then filler: a shared prefix would be served from the
+    # conversation cache and prompt_ms would only count the few new tokens.
+    # The filler sentence is ~36 Qwen tokens; the calibration is in TOKENS_PER_SENTENCE.
+    repeat = max(1, target_tokens // TOKENS_PER_SENTENCE)
+    return (
+        f"Benchmark run {run_id}.\n"
+        + SENTENCE * repeat
+        + "\nWrite a detailed, multi-paragraph explanation of the text above, at least 400 words."
+    )
 
 
 def main():
@@ -55,9 +64,9 @@ def main():
     args = ap.parse_args()
 
     base = args.base_url.rstrip("/")
-    prompt = make_prompt(args.prompt_tokens)
     runs = []
     for i in range(args.runs):
+        prompt = make_prompt(args.prompt_tokens, f"{int(time.time())}-{i}")
         body = {
             "model": args.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -85,6 +94,7 @@ def main():
             "run": i + 1,
             "prompt_tokens": pt,
             "output_tokens": ot,
+            "reused": last.get("reused"),
             "prompt_ms": pm,
             "decode_ms": dt,
             "prompt_tok_s": round(pt / (pm / 1000), 1) if pt and pm else None,
@@ -94,8 +104,8 @@ def main():
         }
         runs.append(run)
         print(
-            "run {run}: prompt {pt} tok {prompt_tok_s} tok/s | decode {ot} tok "
-            "{decode_tok_s} tok/s | hit {hit_rate} | {wall_s} s".format(**run)
+            "run {run}: prompt {prompt_tokens} tok ({reused} reused) {prompt_tok_s} tok/s | "
+            "decode {output_tokens} tok {decode_tok_s} tok/s | hit {hit_rate} | {wall_s} s".format(**run)
         )
 
     def mean(key):
