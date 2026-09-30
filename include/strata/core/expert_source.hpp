@@ -23,6 +23,8 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/pinned.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cstdint>
@@ -32,6 +34,11 @@
 #include <vector>
 
 namespace strata::core {
+
+/// Fork (exposed for the parity test): load the whole expert arena from the model's GGUF shards (native packs),
+/// following the per-layer/per-role shard map in native_experts.txt.  `gguf` is the --native shard.
+LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
+                            const strata::kernels::cpu::ExpertLayout& lay, int threads);
 
 class RemoteExperts;
 

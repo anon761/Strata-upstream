@@ -13,10 +13,12 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/expert_source.hpp"
 
 #include "ggml.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <chrono>
 #include <cmath>
@@ -63,6 +65,31 @@ int main(int argc, char** argv) {
         std::memcpy(blob.data() + f.up_off, gguf.tensor_data(*t[1]) + (size_t) E * f.up_off, f.up_off);
         std::memcpy(blob.data() + f.down_off, gguf.tensor_data(*t[2]) + (size_t) E * (f.bytes - f.down_off),
                     f.bytes - f.down_off);
+        // (arena) the engine's own GGUF expert loader, when a pack dir and the --native shard are given
+        if (argc > 4) {
+            static std::vector<uint8_t> arena;
+            static bool loaded = false;
+            if (!loaded) {
+                std::string le;
+                if (!cpu::expert_layout_load(argv[3], 48, 512, le))
+                    std::printf("  arena: layout load failed: %s\n", le.c_str());
+                const auto& lay = cpu::expert_layout();
+                arena.assign((size_t) lay.total, 0);
+                const strata::core::LoadStats st = strata::core::load_experts_gguf(argv[4], arena.data(), lay, 8);
+                loaded = true;
+                std::printf("  arena: load ok=%d layers=%llu %.1f GiB\n", (int) st.ok,
+                            (unsigned long long) st.layers, (double) lay.total / 1073741824.0);
+            }
+            const auto& lay = cpu::expert_layout();
+            const uint8_t* ab = arena.data() + lay.blob_offset(l, E);
+            double nn = 0, dd = 0;
+            for (size_t i = 0; i < blob.size(); ++i) {
+                nn += std::fabs((double) ab[i] - blob[i]);
+                dd += std::fabs((double) blob[i]);
+            }
+            std::printf("  arena blob layer %d expert %d: rel %.2e %s\n", l, E, nn / (dd + 1e-30),
+                        nn / (dd + 1e-30) < 1e-6 ? "ok" : "FAIL");
+        }
         // (a) the float reference
         const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
         const auto* td = ggml_get_type_traits((ggml_type) f.d_type);
@@ -90,10 +117,27 @@ int main(int argc, char** argv) {
                 ref[k * H + r] = (float) o;
             }
         }
+        // the FP16 dequant path (prefill without MMQ): iq_dequant_gu_f16 / iq_dequant_f16
+        {
+            std::vector<uint16_t> gu16((size_t) 2 * FF * H), d16((size_t) H * FF);
+            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob.data(), blob.data() + f.up_off, FF, H, gu16.data(), s);
+            strata::kernels::iq_dequant_f16(f.d_type, blob.data() + f.down_off, H * FF, d16.data(), s);
+            cudaStreamSynchronize(s);
+            const auto* g16 = (const __half*) gu16.data();
+            const auto* d16p = (const __half*) d16.data();
+            std::vector<float> Gg((size_t) FF * H), Uu((size_t) FF * H), Dd((size_t) H * FF);
+            for (int64_t r = 0; r < FF; ++r)
+                for (int64_t i = 0; i < H; ++i) {
+                    Gg[r * H + i] = __half2float(g16[(size_t) (2 * r) * H + i]);
+                    Uu[r * H + i] = __half2float(g16[(size_t) (2 * r + 1) * H + i]);
+                }
+            for (size_t i = 0; i < Dd.size(); ++i) Dd[i] = __half2float(d16p[i]);
+            std::printf("  dequant16 %s/%s: gu rel %.2e down rel %.2e\n", ggml_type_name((ggml_type) f.gu_type),
+                        ggml_type_name((ggml_type) f.d_type), rel(Gg, G), rel(Dd, D));
+        }
         // (b) the CPU
         {
-            std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
-            std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
+            std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));            std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
             std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
             const void* a[NT];
             float* ffp[NT];
@@ -255,6 +299,47 @@ int main(int argc, char** argv) {
                     ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
                     ok ? "ok" : "FAIL");
         if (!ok) ++failures;
+    }
+    // the native embedding gather (token_embd), if this shard holds it: the same dequantizers the engine uses
+    {
+        const strata::TensorInfo* te = nullptr;
+        for (const auto& ti : gguf.tensors()) if (ti.name == "token_embd.weight") te = &ti;
+        if (te != nullptr && strata::kernels::iq_supported((int) te->type) && te->shape.size() == 2 &&
+            (int64_t) te->shape[0] == H) {
+            const int n_vocab = (int) te->shape[1];
+            const size_t row = strata::kernels::iq_row_bytes((int) te->type, H);
+            std::vector<uint8_t> table(row * (size_t) n_vocab);
+            std::memcpy(table.data(), gguf.tensor_data(*te), row * (size_t) n_vocab);
+            const int NT2 = 3;
+            const int32_t toks[NT2] = {0, 1, n_vocab / 2};
+            const auto* tt = ggml_get_type_traits((ggml_type) te->type);
+            std::vector<float> refv((size_t) NT2 * H), got((size_t) NT2 * H);
+            for (int k = 0; k < NT2; ++k) tt->to_float(table.data() + (size_t) toks[k] * row, refv.data() + k * H, H);
+            void *dtab, *dtok, *drow;
+            float *dout, *dout1;
+            cudaMalloc(&dtab, table.size());
+            cudaMalloc(&dtok, NT2 * 4);
+            cudaMalloc(&dout, (size_t) NT2 * H * 4);
+            cudaMalloc(&drow, row);
+            cudaMalloc(&dout1, H * 4);
+            cudaMemcpy(dtab, table.data(), table.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(dtok, toks, NT2 * 4, cudaMemcpyHostToDevice);
+            cudaGetLastError();
+            strata::kernels::iq_embed_rows((int) te->type, dtab, row, (const int32_t*) dtok, NT2, H, dout, s);
+            cudaStreamSynchronize(s);
+            cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(drow, table.data() + (size_t) toks[0] * row, row, cudaMemcpyHostToDevice);
+            strata::kernels::iq_dequant_f32((int) te->type, drow, H, dout1, s);
+            cudaStreamSynchronize(s);
+            std::vector<float> one(H);
+            cudaMemcpy(one.data(), dout1, H * 4, cudaMemcpyDeviceToHost);
+            const double r = rel(got, refv);
+            std::printf("token_embd %s: embed rel %.2e %s  got[0]=%.4f ref[0]=%.4f dequant[0]=%.4f dequantrel=%.2e\n",
+                        ggml_type_name((ggml_type) te->type), r, r < 1e-5 ? "ok" : "FAIL", got[0], refv[0], one[0],
+                        rel(one, std::vector<float>(refv.begin(), refv.begin() + H)));
+            if (!(r < 1e-5)) ++failures;
+            cudaFree(dtab); cudaFree(dtok); cudaFree(dout); cudaFree(drow); cudaFree(dout1);
+        }
     }
     std::printf("native_expert_parity: %d failures\n", failures);
     return failures ? 1 : 0;
