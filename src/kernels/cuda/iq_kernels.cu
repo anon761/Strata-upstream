@@ -458,8 +458,34 @@ __device__ __forceinline__ float vec_dot_q5_1_q8_1(const void* v, const block_q8
     return sumi * (dm.x * ds.x) + (dm.y * ds.y) / 2.0f;   // QI5_1 / vdr = 2
 }
 
-__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
-    const block_q8_0* w = (const block_q8_0*) v + kbx;
+// Q5_0 (type 6): 32-value blocks of 22 bytes (f16 d + 4-byte 5th bit + 16 nibble bytes). The grouped
+// decode path was missing it (ordinary GGUFs like unsloth's use Q5_0 down projections); the arithmetic
+// is the same as vec_dot_q5_1_q8_1 except the Q5_0 signed bias (-16) folds as -8 * sum(q8).
+__device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q5_0* bq5 = (const block_q5_0*) v + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vl = get_int_b2(bq5->qs, iqs + i);
+        const int vh = get_int_b2(bq5->qh, 0) >> (4 * (iqs + i));
+        int vi0 = (vl >> 0) & 0x0f0f0f0f;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = __dp4a(vi0, get_int_b4(bq8->qs, iqs + i), sumi);
+        int vi1 = (vl >> 4) & 0x0f0f0f0f;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = __dp4a(vi1, get_int_b4(bq8->qs, iqs + i + 4), sumi);
+    }
+    const float2 ds = __half22float2(bq8->ds);
+    return __half2float(bq5->d) * (sumi * ds.x - 8 * ds.y);
+}
+
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {    const block_q8_0* w = (const block_q8_0*) v + kbx;
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -472,6 +498,8 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* v, const block_q8
 
 template<> struct Fmt<7> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_1_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<6> { static constexpr int qk = 32, ipb = 2, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 4, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = 16, step = 2;
@@ -889,6 +917,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
+        case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
@@ -1018,6 +1047,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 7: native_down_kernel<7><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }

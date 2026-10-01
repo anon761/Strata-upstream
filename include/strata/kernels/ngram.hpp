@@ -41,10 +41,14 @@ inline constexpr int NG_HIST = (PLE_CONV_KERNEL - 1) * NGRAM_SIZE;       // 9
 inline constexpr int32_t TOKEN_NULL = -1;       // LLAMA_TOKEN_NULL
 inline constexpr float NG_RMS_EPS = 1e-6f;
 
-// The table: [160, 320001536] IQ4_NL.  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements =
-// 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
+// The table: [160, 320001536].  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements = 5 blocks
+// of 32.  The canonical GSQ-RCO pack stores it IQ4_NL (18 B/block = 90 B/row); ordinary GGUFs (unsloth)
+// store it Q8_0 (34 B/block = 170 B/row), which the reader now supports in the mmap path.
+// The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
-inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
+inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90  (IQ4_NL)
+inline constexpr int PLE_ROW_BYTES_Q8 = (PLE_HEAD_DIM / 32) * 34;        // 170 (Q8_0)
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8;
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///

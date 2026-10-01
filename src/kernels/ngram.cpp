@@ -107,11 +107,34 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160) {
     }
 }
 
+// Q8_0: 32-value blocks of 34 bytes (f16 d + 32 int8), dequant out[i] = d * q[i].  Ordinary GGUFs store the
+// PLE table this way; the block order is plain sequential (no split halves).
+void q8_0_dequant_row(const uint8_t* row, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * 34;
+        uint16_t dbits;
+        std::memcpy(&dbits, blk, 2);
+        const float d = f32_from_f16(dbits);
+        const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
+        for (int j = 0; j < 32; ++j) out160[b * 32 + j] = d * (float) qs[j];
+    }
+}
+
+// Dequantize one raw row by its byte size (90 = IQ4_NL, 170 = Q8_0).
+inline void dequant_row(int row_bytes, const uint8_t* row, float* out160) {
+    if (row_bytes == PLE_ROW_BYTES_Q8) {
+        q8_0_dequant_row(row, out160);
+    } else {
+        iq4nl_dequant_row(row, out160);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 struct PleTable::Impl {
     GgufFile* file = nullptr;
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
+    int row_bytes = PLE_ROW_BYTES;
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
@@ -120,7 +143,7 @@ struct PleTable::Impl {
     strata::ngram::PleReader::Ticket ticket;
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
-    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -150,8 +173,13 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    if (std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL";
+    const char* tname = t->type_name();
+    if (std::strcmp(tname, "IQ4_NL") == 0) {
+        impl_->row_bytes = PLE_ROW_BYTES;
+    } else if (std::strcmp(tname, "Q8_0") == 0) {
+        impl_->row_bytes = PLE_ROW_BYTES_Q8;
+    } else {
+        err = std::string("per_layer_token_embd.weight is ") + tname + ", not IQ4_NL or Q8_0";
         close();
         return false;
     }
@@ -166,7 +194,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
     // assumed.  A wrong data offset would leave a different remainder.
     // A shard may hold other tensors too (Swift 1.5's shard 1 holds layers 0-12 and the table): the table must
     // then fit inside the file at its own offset; alone in its shard (the original's shard 2) it fills it exactly.
-    const uint64_t need = impl_->n_rows * (uint64_t) PLE_ROW_BYTES;
+    const uint64_t need = impl_->n_rows * (uint64_t) impl_->row_bytes;
     const uint64_t have = impl_->file->file_size() - impl_->file->data_start();
     const bool alone = impl_->file->tensors().size() == 1;
     if (alone ? need != have : t->offset + need > have) {
@@ -174,14 +202,19 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         std::snprintf(buf, sizeof buf,
                       "PLE table size mismatch: %llu rows x %d B = %llu at offset %llu, but the file holds %llu from "
                       "data_start %llu",
-                      (unsigned long long) impl_->n_rows, PLE_ROW_BYTES, (unsigned long long) need,
+                      (unsigned long long) impl_->n_rows, impl_->row_bytes, (unsigned long long) need,
                       (unsigned long long) t->offset, (unsigned long long) have,
                       (unsigned long long) impl_->file->data_start());
         err = buf;
         close();
         return false;
     }
-    if (io.mode == PleIo::Direct) {
+    // The unbuffered direct reader is IQ4_NL-only (fixed 90-byte rows); Q8_0 uses the mmap path.
+    const bool direct = io.mode == PleIo::Direct && impl_->row_bytes == PLE_ROW_BYTES;
+    if (io.mode == PleIo::Direct && !direct) {
+        std::fprintf(stderr, "strata: PLE table is %s; using the mmap path (direct reads are IQ4_NL-only)\n", tname);
+    }
+    if (direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
         const uint64_t table_offset = impl_->file->data_start() + t->offset;
@@ -195,7 +228,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         }
         impl_->n_rows = n_rows;
     }
-    impl_->mode = io.mode;
+    impl_->mode = direct ? PleIo::Direct : PleIo::Mmap;
     return true;
 }
 
@@ -231,8 +264,8 @@ void PleTable::read_row(uint32_t row, float* out160) const {
         std::memset(out160, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
         return;
     }
-    iq4nl_dequant_row(impl_->data + (size_t) row * PLE_ROW_BYTES, out160);
-    impl_->bytes_read += PLE_ROW_BYTES;
+    dequant_row(impl_->row_bytes, impl_->data + (size_t) row * impl_->row_bytes, out160);
+    impl_->bytes_read += impl_->row_bytes;
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
@@ -249,8 +282,8 @@ bool PleTable::issue(const uint32_t* rows16) {
         ULONG_PTR n = 0;
         for (int h = 0; h < PLE_N_HEADS; ++h) {
             if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * PLE_ROW_BYTES);
-            ranges[n].NumberOfBytes = PLE_ROW_BYTES;
+            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->row_bytes);
+            ranges[n].NumberOfBytes = impl_->row_bytes;
             ++n;
         }
         if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
@@ -336,8 +369,8 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         for (int h = 0; h < PLE_N_HEADS; ++h) {
             // Out-of-range rows are handled by `read_row` as zeros and have no address to prefetch.
             if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * PLE_ROW_BYTES);
-            ranges[n].NumberOfBytes = PLE_ROW_BYTES;
+            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->row_bytes);
+            ranges[n].NumberOfBytes = impl_->row_bytes;
             ++n;
         }
         if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
