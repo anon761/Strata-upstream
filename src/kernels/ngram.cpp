@@ -6,8 +6,12 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/ngram/ple_reader.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <thread>
 #include <vector>
 #include <stdexcept>
 
@@ -16,6 +20,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace strata::kernels {
@@ -23,6 +29,50 @@ namespace strata::kernels {
 namespace {
 /// The A/B arm.  Host-token-path only, so it needs no atomics; see the note on `ple_prefetch_enable`.
 bool g_ple_prefetch = true;
+
+uint8_t* ram_alloc(uint64_t bytes) {
+#if defined(_WIN32)
+    return (uint8_t*) VirtualAlloc(nullptr, (SIZE_T) bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    (void) madvise(p, bytes, MADV_HUGEPAGE);
+    return (uint8_t*) p;
+#endif
+}
+
+void ram_free(uint8_t* p, uint64_t bytes) {
+    if (p == nullptr) return;
+#if defined(_WIN32)
+    (void) bytes;
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munmap(p, bytes);
+#endif
+}
+
+/// `bytes` of `path` from `offset` into `dst`, in 64 MiB pieces over several threads.
+bool ram_load(const std::string& path, uint64_t offset, uint64_t bytes, uint8_t* dst, std::string& err) {
+    constexpr uint64_t kPiece = 64ull << 20;
+    const uint64_t pieces = (bytes + kPiece - 1) / kPiece;
+    const unsigned threads = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    std::atomic<uint64_t> next{0};
+    std::atomic<bool> failed{false};
+    auto worker = [&] {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { failed = true; return; }
+        for (uint64_t i; !failed && (i = next.fetch_add(1)) < pieces;) {
+            const uint64_t at = i * kPiece, n = std::min(kPiece, bytes - at);
+            f.seekg((std::streamoff) (offset + at));
+            if (!f.read((char*) dst + at, (std::streamsize) n)) failed = true;
+        }
+    };
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
+    for (auto& t : pool) t.join();
+    if (failed) err = "PLE table: reading " + path + " into RAM failed";
+    return !failed;
+}
 }  // namespace
 
 void ple_prefetch_enable(bool on) { g_ple_prefetch = on; }
@@ -136,6 +186,8 @@ struct PleTable::Impl {
     uint64_t n_rows = 0;
     int row_bytes = PLE_ROW_BYTES;
     mutable uint64_t bytes_read = 0;
+    uint8_t* ram = nullptr;           // Ram mode: the table, read in at open
+    uint64_t ram_bytes = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
     PleIo mode = PleIo::Mmap;
@@ -209,6 +261,26 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
+    if (io.mode == PleIo::Ram) {
+        const uint64_t table_offset = impl_->file->data_start() + t->offset;
+        delete impl_->file;   // read through the file, not the mapping: the mapping would only fault it in
+        impl_->file = nullptr;
+        impl_->data = nullptr;
+        impl_->ram = ram_alloc(need);
+        if (impl_->ram == nullptr) {
+            err = "PLE table: no memory for the " + std::to_string(need >> 20) + " MiB table";
+            close();
+            return false;
+        }
+        impl_->ram_bytes = need;
+        if (!ram_load(gguf_path, table_offset, need, impl_->ram, err)) {
+            close();
+            return false;
+        }
+        impl_->data = impl_->ram;
+        impl_->mode = PleIo::Ram;
+        return true;
+    }
     // The unbuffered direct reader is IQ4_NL-only (fixed 90-byte rows); Q8_0 uses the mmap path.
     const bool direct = io.mode == PleIo::Direct && impl_->row_bytes == PLE_ROW_BYTES;
     if (io.mode == PleIo::Direct && !direct) {
@@ -239,6 +311,9 @@ void PleTable::close() {
     delete impl_->file;
     impl_->file = nullptr;
     impl_->data = nullptr;
+    ram_free(impl_->ram, impl_->ram_bytes);
+    impl_->ram = nullptr;
+    impl_->ram_bytes = 0;
     impl_->n_rows = 0;
 }
 

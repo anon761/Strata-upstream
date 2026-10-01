@@ -107,7 +107,11 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
 /// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
 /// after the header parse; nothing else in the process may hold one.
-enum class PleIo { Direct, Mmap };
+///
+/// `Ram` reads the whole table into memory at open (parallel reads, 2 MB pages where the OS gives them) and drops
+/// the mapping: every row is then a memory read. For a host with RAM to spare - a Q8_0 table is ~54 GB, and the
+/// mmap path faults its rows in one at a time, which on a cold file cache costs seconds per prompt.
+enum class PleIo { Direct, Mmap, Ram };
 
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
