@@ -22,7 +22,6 @@ import urllib.request
 REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 
-
 def get(url, start=None, end=None, retries=4):
     for attempt in range(retries):
         try:
@@ -79,8 +78,14 @@ def inventory(out):
 
 
 def fetch(out, only):
-    inv_path = os.path.join(out, "mtp-inventory.json")
-    rows = json.load(open(inv_path))["tensors"] if os.path.exists(inv_path) else inventory(out)
+    global REPO
+    inv = json.load(open(os.path.join(out, "mtp-inventory.json"))) if os.path.exists(
+        os.path.join(out, "mtp-inventory.json")) else None
+    if inv is not None:
+        REPO = inv.get("repo", REPO)   # honour the repo the inventory was taken from
+        rows = inv["tensors"]
+    else:
+        rows = inventory(out)
     tdir = os.path.join(out, "tensors")
     os.makedirs(tdir, exist_ok=True)
     manifest = []
@@ -109,11 +114,17 @@ def fetch(out, only):
 
 
 def main():
+    global REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["inventory", "fetch"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="HF resolve/main base URL of the BF16 checkpoint "
+                                   "(default: the Qwen one). e.g. "
+                                   "https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next/resolve/main/")
     a = ap.parse_args()
+    if a.repo:
+        REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
 
 
