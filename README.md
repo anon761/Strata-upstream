@@ -1,87 +1,79 @@
 # vllm-arcfork
 
-> **A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** (MIT), pinned at upstream `v0.1.28`.
+> **A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** (MIT), merged with upstream `v0.1.32`.
 > This fork is not affiliated with or endorsed by the Strata authors. Upstream's README is kept verbatim at the
 > bottom; the engine, its design and its documentation are upstream's work.
 
 ## What this is
 
 `vllm-arcfork` is an internal fork of the **Strata** inference engine. Strata upstream is a specialised,
-high-performance engine for *one* model - **Qwen3.8-Flash-Next** - and ships it through ISTA-DASLab's
-**GSQ-RCO** pack (2-3.5 bit i-quants: `Q2_0`, `IQ2_XS`, `IQ3_XXS`, `IQ3_S`).
+high-performance engine for *one* model family - **Qwen3.8-Flash-Next** - originally through ISTA-DASLab's
+**GSQ-RCO** i-quant packs, and since v0.1.31 also through ordinary GGUFs such as unsloth's `UD-Q4_K_XL`.
 
-This fork generalises the engine to run **ordinary GGUF quantizations** - the files people actually download,
-e.g. unsloth's `UD-Q4_K_XL` (`Q4_K`/`Q5_K` gate/up, `Q5_1`/`Q8_0` down, `Q8_0` embeddings) - on the GPU, and fixes
-the producer-specific integration gaps those files expose. The reference target is **q4** on a 2x RTX 3090 box.
+The fork runs those ordinary GGUFs - unsloth's `UD-Q4_K_XL` and finetunes such as **Swift-1.5 Q4_K_L** - on a
+**2x RTX 3090** box with a **262K context** for coding agents, and adds what that setup needs on top of upstream.
+It is driven from `mayaservices` as the GGUF backend, next to stock vLLM for safetensors models.
 
-It is meant to be driven from `mayaservices` as the GGUF backend, next to stock vLLM for safetensors models.
+## What the fork adds on top of upstream
 
-## What the fork adds
-
-- **General GGUF input** for the artifact layer: a layer's gate/up and down may live in **different shards**
-  (`native_experts.txt` v4, per-role shard names), `token_embd`/`output` may be `Q8_0`, and the head/embedding are
-  found across every model shard.
-- **K-quant / Q5_0 / Q5_1 / Q8_0 experts on the GPU**: grouped decode vec-dots for `Q4_K`/`Q5_K`/`Q6_K`/`Q5_0`/
-  `Q5_1`/`Q8_0`, the matching FP16 prefill dequantizers (matching ggml's value order), and the llama.cpp **MMQ**
-  template instances - every ordinary down type (incl. `Q5_1`) runs the prompt path through MMQ.
-- **`tools/iq_pack.py`**: writes the PLE conv weight (`blk.1.ple_conv1d.weight`) as **F16** - ordinary GGUFs ship
-  it `F32`/`BF16`, which the PLE kernel mis-read and turned the output into gibberish - and emits v4 per-role
-  expert shards. (`--compat-bf16`, `--down-q8` are fork switches.) A `Q8_0` PLE table (unsloth, Swift-1.5) works.
-- **`tools/mtp_fetch.py --repo`**: the MTP draft head from any BF16 checkpoint (a finetune such as Swift-1.5 has
-  its own).
-- **Linux prefill fix**: pin the **whole expert arena** (upstream caps CUDA registration at 8 GiB, a
-  Windows/WDDM workaround that needlessly applied on Linux) and size the streaming ring by blob size.
-- **Layer split, prompt path**: every stage **borrows its prompt buffers from its own expert cache** (upstream
-  turned borrowing off for a split): 8192-token chunks instead of 2048, and the buffers no longer take cache VRAM.
-  A prompt that fits one chunk lets the **idle stage's GPU stream and compute part of the active stage's
-  experts** over its own PCIe link (`STRATA_PREFILL_HELP=0` turns it off).
-- **Expert arena on transparent huge pages** (Linux, THP `madvise`): the CPU expert pool reads it faster and the
-  expert load at start is quicker.
-- **`--ple-io ram`**: the PLE n-gram table read into RAM at start (a `Q8_0` table is ~54 GB; through mmap its
-  rows were faulted in one at a time, seconds per prompt on a cold cache).
-- **Parity tests** for the ordinary-quant expert paths: `native_expert_parity` (grouped decode vs ggml, plus the
-  FP16 dequant and the engine's own arena loader) and `moe_mmq_parity` (prefill MMQ and `native_mmvq` vs ggml).
+- **Conversation parking with a layer split.** Upstream's conversation cache (`--conversation-cache-mib`) parks
+  whole conversations in RAM but refused `--layer-split`. Here every stage parks its own part (running state,
+  checkpoint states, K/V of its layers; the draft layer's with the last stage) and restores it on its own GPU,
+  so clients that take turns (an agent, the web chat, the Matrix bot) no longer re-read each other's context.
+  Validated with upstream's `tools/conversation_cache_parity.py` (A/B/A byte-exact state, pressure fallback).
+- **The idle GPU helps short prompts.** A prompt that fits one chunk runs the split's stages one after the
+  other; the idle stage's GPU streams and computes part of the active stage's experts over its own PCIe link
+  (deterministic, `STRATA_PREFILL_HELP=0` turns it off): 2K-token prompts +28-34%.
+- **Follow-ups resume their session.** A verify window commits only the tokens it hands out (an answer that
+  ended inside an accepted draft left the session ahead of the client), and the server keeps the recent requests'
+  own token ids, since a model's sampled tokens are not always the tokenizer's split of the same text.
+- **Q5_0 down experts on the GPU** (Swift-1.5 Q4_K_L, OrcaRouter Q4_K_S) and a **Q8_0 PLE table** (unsloth,
+  Swift-1.5).
+- The expert arena on **transparent huge pages** (Linux, THP `madvise`).
+- Tools: `iq_pack.py` prints `IQPACK_PROGRESS` lines (mayaservices' progress bar); `mtp_fetch.py --repo` fetches
+  the MTP head from a finetune's own BF16 checkpoint.
 - `setup.py` prefers the pip-installed `cmake`/`ninja` (a distro cmake is too old for the CUDA 20 dialect).
+
+Earlier fork work that upstream now has in its own form (and that the fork follows): ordinary GGUF experts
+(Q4_K/Q5_K/Q5_1/Q8_0) with MMQ, per-role expert shards, `--ple-io ram`, the prompt loans of a layer split.
 
 ## Measured results
 
 2x **RTX 3090** (24 GB each), AMD EPYC 7413, **450 GB** RAM, driver 580, CUDA 13.3, layer split across both cards,
-**262K context**, MTP speculative decoding on (`--spec 4`), `--pcie-frac 0 --ple-io ram`. Single request, OpenAI
-`/v1/chat/completions`, a coding workload: prompts of real C++/CUDA source, a code-writing task for decode
-(768 tokens, greedy), and a follow-up turn on an 8K conversation (time to first token, the prefix reused). Decode
-excludes time-to-first-token and includes the accepted drafts, so it varies with the text.
+**262K context**, MTP speculative decoding on (`--spec 4`), `--pcie-frac 0 --ple-io ram`, conversation parking on.
+Single request, OpenAI `/v1/chat/completions`, a coding workload: prompts of real C++/CUDA source, a code-writing
+task for decode (768 tokens, greedy), and a follow-up turn on an 8K conversation (time to first token, the prefix
+reused). Decode excludes time-to-first-token and includes the accepted drafts, so it varies with the text.
 
 | Engine, model | Prefill 2K | 8K | 32K | Decode tok/s | Follow-up turn |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **this fork, unsloth `UD-Q4_K_XL`** (103.7 GiB) | **~1,070** | **~1,800** | **~2,980** | **~108** | **~0.3 s** |
-| this fork, `Swift-1.5 Q4_K_L` | ~800 | ~1,790 | ~2,970 | ~108 | ~0.3 s |
+| **this fork, unsloth `UD-Q4_K_XL`** (103.7 GiB) | **~1,010** | **~1,860** | **~3,260** | **~116** | **~0.17 s** |
+| **this fork, `Swift-1.5 Q4_K_L`** | ~1,020 | ~1,830 | ~3,210 | ~117 | ~0.22 s |
 | FreeToken, `Swift-1.5 NVFP4` (tensor parallel over both cards) | ~1,280 | ~1,450 | ~1,630 | ~104 | ~1.1 s |
-| this fork before the changes above (v0.1.28 + ordinary GGUFs), `UD-Q4_K_XL` | ~650 | ~1,170 | ~1,370 | ~71 | ~0.4 s |
+| the fork on v0.1.28 before this work, `UD-Q4_K_XL` | ~650 | ~1,170 | ~1,370 | ~71 | ~0.4 s |
 
-The Swift row was measured before the idle-GPU help for one-chunk prompts (its 2K prefill should gain like the
-`UD-Q4_K_XL` row's). Needle-in-a-haystack recall 9/9 at 32K/128K/258K and 10/10 at 2K/4K.
+Two 8K coding conversations taking turns (A, B, A, B, ...): a follow-up's time to first token **~4.6 s without
+parking, ~0.63 s with it** (the other conversation's context is restored instead of read again). Needle-in-a-
+haystack recall 12/12 at 2K/32K/128K/250K.
 
-What moved decode from ~71 to ~108 tok/s: `--pcie-frac 0` (an expert-cache miss is computed by the CPU pool instead
-of fetched over PCIe: the EPYC's 23 pool workers are faster than the link here; the upstream default 0.55 suits a
-6-core desktop), `--spec 4`, the borrowed prompt buffers (13% more cache slots) and the huge-page arena.
-
-Earlier, at 32K context and a ~2K prompt: the upstream `GSQ-RCO IQ2_XS` pack (68 GiB) ~2,480 tok/s prefill /
-~88 tok/s decode. **Stock vLLM** with a 4-bit safetensors model (Swift 1.5 W4A16, 116 GB) does not fit 48 GB VRAM;
-with ~30 GB of experts offloaded to host RAM it reaches only ~290 tok/s prefill / ~12.7 tok/s decode. llama.cpp
-(qwen4exp build, two-band offload) is ~13-14 tok/s decode.
+`--pcie-frac 0` (an expert-cache miss is computed by the CPU pool instead of fetched over PCIe) suits a CPU with
+many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep the default.
 
 ## Building and running
 
 ```bash
 git clone <this fork> && cd vllm-arcfork
-./setup.sh --build --model IQ2_XS --gpus 0,1   # source build (sm_86) + an upstream pack, or:
+# a source build for the ordinary GGUFs: the K-quant (and Q5_0) MMQ prompt kernels are build options, off upstream
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+      -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_ORCA_Q4KS_MMQ=ON
+ninja -C build strata
 ```
 
 For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and the MTP head and point the server at them
 (`mayaservices`' `strata-run.py` builds a missing pack and MTP head itself):
 
 ```bash
-# 1) build the native pack (reads every shard; --compat-bf16 dequantizes the small projections)
+# 1) the native pack (reads every shard; --compat-bf16 dequantizes the small projections)
 .venv/bin/python tools/iq_pack.py --gguf <shard1.gguf> --out /path/to/pack --compat-bf16
 # 2) the MTP head (--repo: the BF16 checkpoint of a finetune, e.g. Swift-1.5's), as setup.py does
 .venv/bin/python tools/mtp_fetch.py fetch --out <mtp dir> [--repo <hf resolve/main url>]
@@ -90,11 +82,13 @@ For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and the MTP
 # 3) a run config (see serve/server.py --help) with:
 #    --pack <pack> --native <shard1> --native-head-gguf <shard with output.weight> --ple-gguf <shard with PLE>
 #    --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --mtp <mtp dir>/rt
-#    --max-context 262000 --kv int8 --pcie-frac 0 --ple-io ram   and  "gpu": [0,1], "layer_split": "auto"
+#    --max-context 262000 --kv int8 --pcie-frac 0 --ple-io ram
+#    --conversation-cache-mib 16384 --conversation-cache-slots 4   and  "gpu": [0,1], "layer_split": "auto"
 ```
 
-`--pcie-frac 0` assumes a CPU with many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep
-the default. `--ple-io ram` needs RAM for the table (IQ4_NL ~28 GB, Q8_0 ~54 GB) on top of the expert arena.
+A pack written by the fork before the merge (`native_experts.txt` with space-separated per-role shards) has to be
+written again with this `iq_pack.py`. `--ple-io ram` needs RAM for the table (IQ4_NL ~28 GB, Q8_0 ~54 GB; a cold
+start reads it in ~1-2 min) on top of the expert arena; parking adds up to its budget.
 
 Requirements are upstream's: an NVIDIA RTX 20+ card, a current driver, and (for a source build) a CUDA toolkit
 with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
@@ -103,7 +97,8 @@ with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
 
 - **Single GPU in an LXC** can fail `cublasCreate` when the expert cache fills VRAM (container pinning limits).
   The 2-GPU layer split is the supported configuration.
-- The upstream `--expert-cache-per-layer` policy aborts on native packs with mixed blob sizes; not used here.
+- Split parking makes a full copy on every park (upstream's retained-K/V reuse is single-GPU only); a 2K-token
+  conversation parks in ~150 ms. `--split-device 0` (the one-GPU check of the hand-off) refuses parking.
 
 ## License and attribution
 
