@@ -443,6 +443,34 @@ __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq,
     return d8_0 * d8_1 * ((float) sumi);
 }
 
+// Q5_0 (type 6): 32-value blocks of 22 bytes (f16 d + 4 bytes of fifth bits + 16 nibble bytes), the down
+// experts of e.g. Swift-1.5 Q4_K_L and OrcaRouter's Q4_K_S.  The same unpacking as vec_dot_q5_1_q8_1, and like it
+// the offset term (-16 per value) multiplies the sum of the QUANTIZED activations (ggml-cpu's convention), not ds.y.
+__device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* v, const block_q8_1* bq8, int kbx, int iqs) {
+    const block_q5_0* bq5 = (const block_q5_0*) v + kbx;
+    int sumi = 0, sumu = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vl = get_int_b2(bq5->qs, iqs + i);
+        const int vh = get_int_b2(bq5->qh, 0) >> (4 * (iqs + i));
+        const int u0 = get_int_b4(bq8->qs, iqs + i), u1 = get_int_b4(bq8->qs, iqs + i + QI5_0);
+        int vi0 = (vl >> 0) & 0x0f0f0f0f;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi0, u0, sumi);
+        int vi1 = (vl >> 4) & 0x0f0f0f0f;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi1, u1, sumi);
+        sumu = ggml_cuda_dp4a(0x01010101, u1, ggml_cuda_dp4a(0x01010101, u0, sumu));
+    }
+    return __half2float(bq5->d) * __low2float(bq8->ds) * (float) (sumi - 16 * sumu);
+}
+
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
@@ -470,13 +498,15 @@ template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<7> { static constexpr int qk = 32, ipb = QI5_1 / VDR_Q5_1, step = VDR_Q5_1;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_1_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<6> { static constexpr int qk = 32, ipb = 2, step = 2;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0, step = VDR_Q8_0;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
 
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(8)
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(8)
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(8)
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -1210,6 +1240,22 @@ __device__ void dq_q5_1(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 template<typename dst_t>
+__device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q5_0* x = (const block_q5_0*) vx + ibs * (QK_K / QK5_0);
+    const int ib = tid % 8, il = tid / 8;
+    const float d = __half2float(x[ib].d);
+    uint32_t qh;
+    memcpy(&qh, x[ib].qh, sizeof(qh));
+    dst_t* y = yy + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;                   // llama.cpp's dequantize_q5_0 for value pairs iqs, iqs + 16
+        const int xh_0 = ((qh >> (iqs + 0)) << 4) & 0x10;
+        const int xh_1 = ((qh >> (iqs + 12))) & 0x10;
+        y[iqs] = cvt<dst_t>((float) (((x[ib].qs[iqs] & 0xf) | xh_0) - 16) * d);
+        y[iqs + 16] = cvt<dst_t>((float) (((x[ib].qs[iqs] >> 4) | xh_1) - 16) * d);
+    }
+}
+template<typename dst_t>
 __device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
     const int ib = tid % 8, il = tid / 8;
@@ -1243,6 +1289,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 12: dq_q4_k(vx, ibs, y, tid); break;
         case 13: dq_q5_k(vx, ibs, y, tid); break;
         case 7: dq_q5_1(vx, ibs, y, tid); break;
+        case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
@@ -1267,7 +1314,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 7 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 8;
 }
 // values per block of the types the grouped expert kernels take (0 = none)
 int gu_qk(int t) {
@@ -1347,6 +1394,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
+        case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
