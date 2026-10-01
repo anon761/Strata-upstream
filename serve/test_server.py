@@ -566,7 +566,7 @@ class SessionTokens(unittest.TestCase):
         cancel.set()
         for _ in svc.run(ids, thinking, None, max_new, {}, cancel):
             pass
-        self.assertIsNone(svc.session)
+        self.assertEqual(len(svc.sessions), 0)
 
 
 class DyingEngine(MockEngine):

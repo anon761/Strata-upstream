@@ -731,6 +731,11 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        # The engine resumes a prompt from its live session or a parked conversation only token for token, and a
+        # model's own tokens are not always the tokenizer's split of the same text: the recent finished requests'
+        # ids (prompt + generated) and their text, so a follow-up that renders one of them again starts with those
+        # very ids (prepare).  As many as the engine can park, a few more.
+        self.sessions = collections.deque(maxlen=8)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
@@ -1084,9 +1089,15 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
+        session = None if images else max((x for x in list(self.sessions)
+                                           if len(prompt) > len(x[1]) and prompt.startswith(x[1])),
+                                          key=lambda x: len(x[1]), default=None)
+        if session is not None:
+            ids = session[0] + self.tok.encode(prompt[len(session[1]):], parse_special=True)
+        else:
+            ids = self.tok.encode(prompt, parse_special=True)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -1170,6 +1181,17 @@ class Service:
             print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
+
+    def _session_of(self, ids, raw_ids):
+        """(ids, text) of a finished request's prompt and answer; None when they do not decode to text exactly (a
+        UTF-8 character split by the token limit)."""
+        if not raw_ids:
+            return None
+        full = list(ids) + raw_ids
+        try:
+            return full, self.tok.decode(full, errors="strict")
+        except UnicodeDecodeError:
+            return None
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
@@ -1280,6 +1302,11 @@ class Service:
                     finish = "disconnect"
                     raise
                 finally:
+                    # what the engine's session now holds (an image's ids stand for embeddings: no text to match)
+                    if finish in ("stop", "length") and not emb:
+                        session = self._session_of(ids, raw_ids)
+                        if session is not None:
+                            self.sessions.append(session)
                     # #266: settle this request's status, history and totals while still holding the fifo: once
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
