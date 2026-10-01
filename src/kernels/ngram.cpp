@@ -140,6 +140,7 @@ struct PleTable::Impl {
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     bool q5_0 = false;                // #296: Q5_0 rows (110 B), the mapped reader only
+    bool q8_0 = false;                // Q8_0 rows (170 B: unsloth's GGUFs, Swift-1.5), the mapped reader only
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
@@ -157,6 +158,8 @@ struct PleTable::Impl {
         if (fp8) fp8_e4m3_dequant_row(row, scale, out160);
         else if (q5_0)
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
+        else if (q8_0)
+            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
         else iq4nl_dequant_row(row, out160);
     }
 };
@@ -188,11 +191,13 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL (ISTA-DASLab's shard 2, the original's own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as
-    // shipped: I8 bytes marked strata.ple.format = f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
+    // IQ4_NL (ISTA-DASLab's shard 2, the original's own GGUF), Q5_0 (#296: OrcaRouter's GGUF), Q8_0 (unsloth's GGUFs,
+    // Swift-1.5), or the FP8 table as shipped: I8 bytes marked strata.ple.format = f8_e4m3 with strata.ple.scale
+    // (tools/ple_fp8_pack.py)
     impl_->fp8 = false;
     impl_->q5_0 = std::strcmp(t->type_name(), "Q5_0") == 0;
-    impl_->rb = impl_->q5_0 ? (PLE_HEAD_DIM / 32) * 22 : PLE_ROW_BYTES;
+    impl_->q8_0 = std::strcmp(t->type_name(), "Q8_0") == 0;
+    impl_->rb = impl_->q5_0 ? (PLE_HEAD_DIM / 32) * 22 : impl_->q8_0 ? PLE_ROW_BYTES_Q8 : PLE_ROW_BYTES;
     if (std::strcmp(t->type_name(), "I8") == 0) {
         const MetaValue* f = impl_->file->get("strata.ple.format");
         const MetaValue* s = impl_->file->get("strata.ple.scale");
@@ -204,17 +209,18 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->fp8 = true;
         impl_->scale = (float) s->num();
         impl_->rb = PLE_ROW_BYTES_FP8;
-    } else if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or FP8 (I8)";
+    } else if (!impl_->q5_0 && !impl_->q8_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0, Q8_0 or FP8 (I8)";
         close();
         return false;
     }
-    // The direct reader has fixed 90-byte rows. Keep it for IQ4_NL; Q5_0's
-    // 110-byte rows use the mapped path until that reader supports variable rows.
-    if (impl_->q5_0 && io.mode == PleIo::Direct) {
-        err = "Q5_0 PLE requires --ple-io mmap";
-        close();
-        return false;
+    // The direct reader is kept for IQ4_NL; Q5_0's 110-byte and Q8_0's 170-byte rows are read through the mapping
+    // (--ple-io ram: the mapping locked in memory), and a table in one of them asked for direct reads gets mmap.
+    PleIo mode = io.mode;
+    if ((impl_->q5_0 || impl_->q8_0) && mode == PleIo::Direct) {
+        std::fprintf(stderr, "strata: PLE table is %s; reading it through mmap (direct reads are IQ4_NL-only)\n",
+                     impl_->q5_0 ? "Q5_0" : "Q8_0");
+        mode = PleIo::Mmap;
     }
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
@@ -242,7 +248,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    if (io.mode == PleIo::Direct) {
+    if (mode == PleIo::Direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
         const uint64_t table_offset = impl_->file->data_start() + t->offset;
@@ -258,7 +264,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->reader.set_keepalive(io.keepalive_ms, io.keepalive_window_s);
         impl_->n_rows = n_rows;
     }
-    if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
+    if (mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
 #if !defined(_WIN32)
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
@@ -275,7 +281,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         }
 #endif
     }
-    impl_->mode = io.mode;
+    impl_->mode = mode;
     return true;
 }
 
@@ -290,12 +296,15 @@ void PleTable::close() {
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->q5_0 = false;
+    impl_->q8_0 = false;
     impl_->fp8 = false;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
-const char* PleTable::format() const { return impl_->fp8 ? "F8_E4M3" : impl_->q5_0 ? "Q5_0" : "IQ4_NL"; }
+const char* PleTable::format() const {
+    return impl_->fp8 ? "F8_E4M3" : impl_->q5_0 ? "Q5_0" : impl_->q8_0 ? "Q8_0" : "IQ4_NL";
+}
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
