@@ -4053,6 +4053,11 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
+        if (multi_gpu) {   // a prompt of one chunk: the idle neighbour streams part of each stage's experts
+            std::vector<strata::prefill::Prefill*> paths{&sp};
+            for (const auto& st : stages) paths.push_back(&st->sp);
+            for (size_t i = 0; i < paths.size(); ++i) paths[i]->set_helper(paths[i + 1 < paths.size() ? i + 1 : i - 1]);
+        }
         mem_mark("the head and the prompt path");
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
         // S-token chunk's buffers for the whole session (0.1.29's own buffers, carved from the tail of its cache):
