@@ -21,15 +21,24 @@ It is meant to be driven from `mayaservices` as the GGUF backend, next to stock 
 - **General GGUF input** for the artifact layer: a layer's gate/up and down may live in **different shards**
   (`native_experts.txt` v4, per-role shard names), `token_embd`/`output` may be `Q8_0`, and the head/embedding are
   found across every model shard.
-- **K-quant / Q5_1 / Q8_0 experts on the GPU**: grouped decode vec-dots for `Q4_K`/`Q5_K`/`Q6_K`/`Q5_1`/`Q8_0`,
-  the matching FP16 prefill dequantizers (matching ggml's value order), and the llama.cpp **MMQ** template
-  instances for the K-quants.
+- **K-quant / Q5_0 / Q5_1 / Q8_0 experts on the GPU**: grouped decode vec-dots for `Q4_K`/`Q5_K`/`Q6_K`/`Q5_0`/
+  `Q5_1`/`Q8_0`, the matching FP16 prefill dequantizers (matching ggml's value order), and the llama.cpp **MMQ**
+  template instances - every ordinary down type (incl. `Q5_1`) runs the prompt path through MMQ.
 - **`tools/iq_pack.py`**: writes the PLE conv weight (`blk.1.ple_conv1d.weight`) as **F16** - ordinary GGUFs ship
   it `F32`/`BF16`, which the PLE kernel mis-read and turned the output into gibberish - and emits v4 per-role
-  expert shards. (`--compat-bf16`, `--down-q8` are fork switches.)
+  expert shards. (`--compat-bf16`, `--down-q8` are fork switches.) A `Q8_0` PLE table (unsloth, Swift-1.5) works.
+- **`tools/mtp_fetch.py --repo`**: the MTP draft head from any BF16 checkpoint (a finetune such as Swift-1.5 has
+  its own).
 - **Linux prefill fix**: pin the **whole expert arena** (upstream caps CUDA registration at 8 GiB, a
-  Windows/WDDM workaround that needlessly applied on Linux) and size the streaming ring by blob size. On 2x RTX
-  3090 this lifts unsloth `UD-Q4_K_XL` prefill from ~400 to ~890 tok/s.
+  Windows/WDDM workaround that needlessly applied on Linux) and size the streaming ring by blob size.
+- **Layer split, prompt path**: every stage **borrows its prompt buffers from its own expert cache** (upstream
+  turned borrowing off for a split): 8192-token chunks instead of 2048, and the buffers no longer take cache VRAM.
+  A prompt that fits one chunk lets the **idle stage's GPU stream and compute part of the active stage's
+  experts** over its own PCIe link (`STRATA_PREFILL_HELP=0` turns it off).
+- **Expert arena on transparent huge pages** (Linux, THP `madvise`): the CPU expert pool reads it faster and the
+  expert load at start is quicker.
+- **`--ple-io ram`**: the PLE n-gram table read into RAM at start (a `Q8_0` table is ~54 GB; through mmap its
+  rows were faulted in one at a time, seconds per prompt on a cold cache).
 - **Parity tests** for the ordinary-quant expert paths: `native_expert_parity` (grouped decode vs ggml, plus the
   FP16 dequant and the engine's own arena loader) and `moe_mmq_parity` (prefill MMQ and `native_mmvq` vs ggml).
 - `setup.py` prefers the pip-installed `cmake`/`ninja` (a distro cmake is too old for the CUDA 20 dialect).
@@ -37,19 +46,29 @@ It is meant to be driven from `mayaservices` as the GGUF backend, next to stock 
 ## Measured results
 
 2x **RTX 3090** (24 GB each), AMD EPYC 7413, **450 GB** RAM, driver 580, CUDA 13.3, layer split across both cards,
-32K context. Single request, OpenAI `/v1/chat/completions`; prefill on a ~2,067-token prompt, decode on 128-256
-output tokens (decode excludes time-to-first-token).
+**262K context**, MTP speculative decoding on (`--spec 4`), `--pcie-frac 0 --ple-io ram`. Single request, OpenAI
+`/v1/chat/completions`, a coding workload: prompts of real C++/CUDA source, a code-writing task for decode
+(768 tokens, greedy), and a follow-up turn on an 8K conversation (time to first token, the prefix reused). Decode
+excludes time-to-first-token and includes the accepted drafts, so it varies with the text.
 
-| Model (GGUF) | Experts | Prefill tok/s | Decode tok/s | Notes |
-| --- | --- | ---: | ---: | --- |
-| **unsloth `UD-Q4_K_XL`** (103.7 GiB) | Q4_K/Q5_K gate/up, Q5_1/Q8_0 down | **~890** | **~79** | K=26/28 split, ~97% of the routed mass cached, MTP acceptance ~68% |
-| unsloth `UD-Q4_K_XL`, before the arena-pin fix | same | ~400 | ~72 | the 8 GiB registration cap left most experts unregistered |
-| ISTA-DASLab `GSQ-RCO IQ2_XS` (upstream pack, 68 GiB) | IQ2_XS / Q2_0 | ~2480 | ~88 | smaller experts, ~100% cached |
+| Engine, model | Prefill 2K | 8K | 32K | Decode tok/s | Follow-up turn |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **this fork, unsloth `UD-Q4_K_XL`** (103.7 GiB) | **~1,070** | **~1,800** | **~2,980** | **~108** | **~0.3 s** |
+| this fork, `Swift-1.5 Q4_K_L` | ~800 | ~1,790 | ~2,970 | ~108 | ~0.3 s |
+| FreeToken, `Swift-1.5 NVFP4` (tensor parallel over both cards) | ~1,280 | ~1,450 | ~1,630 | ~104 | ~1.1 s |
+| this fork before the changes above (v0.1.28 + ordinary GGUFs), `UD-Q4_K_XL` | ~650 | ~1,170 | ~1,370 | ~71 | ~0.4 s |
 
-For context on the same box: **stock vLLM** with a 4-bit safetensors model (Swift 1.5 W4A16, 116 GB) does not fit
-48 GB VRAM; with ~30 GB of experts offloaded to host RAM it reaches only ~290 tok/s prefill / ~12.7 tok/s decode.
-llama.cpp (qwen4exp build, two-band offload) is ~13-14 tok/s decode. So on 2x 3090 the fork is the fastest of the
-three for this model.
+The Swift row was measured before the idle-GPU help for one-chunk prompts (its 2K prefill should gain like the
+`UD-Q4_K_XL` row's). Needle-in-a-haystack recall 9/9 at 32K/128K/258K and 10/10 at 2K/4K.
+
+What moved decode from ~71 to ~108 tok/s: `--pcie-frac 0` (an expert-cache miss is computed by the CPU pool instead
+of fetched over PCIe: the EPYC's 23 pool workers are faster than the link here; the upstream default 0.55 suits a
+6-core desktop), `--spec 4`, the borrowed prompt buffers (13% more cache slots) and the huge-page arena.
+
+Earlier, at 32K context and a ~2K prompt: the upstream `GSQ-RCO IQ2_XS` pack (68 GiB) ~2,480 tok/s prefill /
+~88 tok/s decode. **Stock vLLM** with a 4-bit safetensors model (Swift 1.5 W4A16, 116 GB) does not fit 48 GB VRAM;
+with ~30 GB of experts offloaded to host RAM it reaches only ~290 tok/s prefill / ~12.7 tok/s decode. llama.cpp
+(qwen4exp build, two-band offload) is ~13-14 tok/s decode.
 
 ## Building and running
 
@@ -58,16 +77,24 @@ git clone <this fork> && cd vllm-arcfork
 ./setup.sh --build --model IQ2_XS --gpus 0,1   # source build (sm_86) + an upstream pack, or:
 ```
 
-For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and point the server at it:
+For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and the MTP head and point the server at them
+(`mayaservices`' `strata-run.py` builds a missing pack and MTP head itself):
 
 ```bash
 # 1) build the native pack (reads every shard; --compat-bf16 dequantizes the small projections)
 .venv/bin/python tools/iq_pack.py --gguf <shard1.gguf> --out /path/to/pack --compat-bf16
-# 2) a run config (see serve/server.py --help) with:
+# 2) the MTP head (--repo: the BF16 checkpoint of a finetune, e.g. Swift-1.5's), as setup.py does
+.venv/bin/python tools/mtp_fetch.py fetch --out <mtp dir> [--repo <hf resolve/main url>]
+.venv/bin/python tools/mtp_pack.py --src <mtp dir> --experts q2_0 --out <mtp dir>/mtp-q2_0.gguf
+.venv/bin/python tools/mtp_rt.py --gguf <mtp dir>/mtp-q2_0.gguf --out <mtp dir>/rt && cp data/draft_vocab.bin <mtp dir>/rt/
+# 3) a run config (see serve/server.py --help) with:
 #    --pack <pack> --native <shard1> --native-head-gguf <shard with output.weight> --ple-gguf <shard with PLE>
-#    --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --mtp <mtp dir>
-#    --max-context 32768 --kv int8   and  "gpu": [0,1], "layer_split": "auto"
+#    --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --mtp <mtp dir>/rt
+#    --max-context 262000 --kv int8 --pcie-frac 0 --ple-io ram   and  "gpu": [0,1], "layer_split": "auto"
 ```
+
+`--pcie-frac 0` assumes a CPU with many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep
+the default. `--ple-io ram` needs RAM for the table (IQ4_NL ~28 GB, Q8_0 ~54 GB) on top of the expert arena.
 
 Requirements are upstream's: an NVIDIA RTX 20+ card, a current driver, and (for a source build) a CUDA toolkit
 with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
