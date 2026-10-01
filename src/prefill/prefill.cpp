@@ -372,7 +372,7 @@ struct Prefill::Impl {
     float* help_y = nullptr;                 // the helper's weighted sum per token (T x N)
     float* help_w_all = nullptr;             // the layer's routing weights (T x K), read back for the split
     int32_t* help_tok = nullptr;             // per helper row: its token
-    float* help_w = nullptr;                 // per helper row: its routing weight
+    int32_t* help_pair_row = nullptr;        // per (token, k) pair: its helper row, or -1 (the stage's own)
     int32_t* help_bounds = nullptr;          // the helper's MMQ bounds (compute's layout)
     uint32_t* help_flags = nullptr;          // [activations ready, sum ready] (sequence numbers)
     uint32_t help_seq = 0;
@@ -445,7 +445,7 @@ void Prefill::release() {
     if (impl_->help_stream) cudaStreamDestroy(impl_->help_stream);
     if (impl_->help_ev) cudaEventDestroy(impl_->help_ev);
     for (void* p : {(void*) impl_->help_x, (void*) impl_->help_y, (void*) impl_->help_w_all, (void*) impl_->help_tok,
-                    (void*) impl_->help_w, (void*) impl_->help_bounds, (void*) impl_->help_flags})
+                    (void*) impl_->help_pair_row, (void*) impl_->help_bounds, (void*) impl_->help_flags})
         if (p) cudaFreeHost(p);
     for (void* p : impl_->owned) cudaFree(p);
 }
@@ -1016,7 +1016,8 @@ struct Prefill::HelpJob {
     std::vector<int32_t> cnt;                // rows per expert
     const float* x = nullptr;                // the layer's activations, T x N (mapped)
     const int32_t* tok = nullptr;            // per row: its token
-    const float* w = nullptr;                // per row: its routing weight
+    const int32_t* pair_row = nullptr;       // per (token, k) pair: its row, or -1 (T x K)
+    const float* pair_w = nullptr;           // per (token, k) pair: its routing weight (T x K)
     const int32_t* bounds = nullptr;         // compute's MMQ bounds over the helper's experts
     int64_t n_bounds = 0;
     const uint32_t* flag_x = nullptr;        // >= seq: x is in host memory
@@ -1085,7 +1086,8 @@ bool Prefill::help_layer(const HelpJob& j, std::string& err) {
     strata::kernels::wait_flag_ge(j.flag_x, j.seq, cs);
     cudaMemcpyAsync(m.mixed, j.x, (size_t) j.T * N * 4, cudaMemcpyHostToDevice, cs);
     cudaMemcpyAsync(m.src_dev, j.tok, (size_t) j.rows * 4, cudaMemcpyHostToDevice, cs);
-    cudaMemcpyAsync(m.w, j.w, (size_t) j.rows * 4, cudaMemcpyHostToDevice, cs);
+    cudaMemcpyAsync(m.slot_dev, j.pair_row, (size_t) j.T * K * 4, cudaMemcpyHostToDevice, cs);
+    cudaMemcpyAsync(m.w, j.pair_w, (size_t) j.T * K * 4, cudaMemcpyHostToDevice, cs);
     cudaMemcpyAsync(m.bounds_dev, j.bounds, (size_t) j.n_bounds * 4, cudaMemcpyHostToDevice, cs);
     mmq::iota(m.ids_identity, j.rows, cs);
     mmq::quantize(m.mixed, m.src_dev, m.Xq, gt, N, N, j.rows, cs);
@@ -1120,9 +1122,8 @@ bool Prefill::help_layer(const HelpJob& j, std::string& err) {
         dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N; dn.ld_dst = N;
         m.mmq_ctx->run(dn, cs);
     }
-    // each token's weighted sum over its helper rows, back to the stage
-    cudaMemsetAsync(m.bo, 0, (size_t) j.T * N * 4, cs);
-    scatter_rows_weighted(m.Dm, m.src_dev, m.w, j.rows, m.bo, cs);
+    // each token's weighted sum over its helper rows, in k order (the same bits every run), back to the stage
+    sum_rows_by_pair(m.Dm, m.slot_dev, m.w, j.T, m.bo, cs);
     cudaMemcpyAsync(j.y, m.bo, (size_t) j.T * N * 4, cudaMemcpyDeviceToHost, cs);
     set_flag(j.flag_y, j.seq, cs);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
@@ -1300,12 +1301,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (help) {
             if (m.help_cap < m.T) {
                 for (void* p : {(void*) m.help_x, (void*) m.help_y, (void*) m.help_w_all, (void*) m.help_tok,
-                                (void*) m.help_w, (void*) m.help_bounds, (void*) m.help_flags})
+                                (void*) m.help_pair_row, (void*) m.help_bounds, (void*) m.help_flags})
                     if (p) cudaFreeHost(p);
                 const size_t tk = (size_t) m.T * K, nb = (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
                 if (!host_alloc_mapped(m.help_x, (size_t) m.T * N * 4) || !host_alloc_mapped(m.help_y, (size_t) m.T * N * 4) ||
                     !host_alloc_mapped(m.help_w_all, tk * 4) || !host_alloc_mapped(m.help_tok, tk * 4) ||
-                    !host_alloc_mapped(m.help_w, tk * 4) || !host_alloc_mapped(m.help_bounds, nb * 4) ||
+                    !host_alloc_mapped(m.help_pair_row, tk * 4) || !host_alloc_mapped(m.help_bounds, nb * 4) ||
                     !host_alloc_mapped(m.help_flags, 2 * sizeof(uint32_t))) {
                     err = "prefill: the layer split's help buffers";
                     return false;
@@ -1801,10 +1802,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         const int32_t p = fill[(size_t) e]++;
                         slot_h[(size_t) i] = p;
                         src_h[(size_t) p] = (int32_t) (i / K);
-                        if (p >= rows_here) {
-                            m.help_tok[p - rows_here] = (int32_t) (i / K);
-                            m.help_w[p - rows_here] = m.help_w_all[i];
-                        }
+                        if (help_l) m.help_pair_row[i] = p >= rows_here ? p - rows_here : -1;
+                        if (p >= rows_here) m.help_tok[p - rows_here] = (int32_t) (i / K);
                     }
                     if (grp_mapped) {
                         copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
@@ -1838,7 +1837,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                 m.help_bounds[nh + 1 + gi * (MMQ_GROUP + 1) + i] =
                                     m.help_bounds[std::min(nh, gi * MMQ_GROUP + i)] - m.help_bounds[gi * MMQ_GROUP];
-                        job.x = m.help_x; job.tok = m.help_tok; job.w = m.help_w; job.bounds = m.help_bounds;
+                        job.x = m.help_x; job.tok = m.help_tok; job.pair_row = m.help_pair_row;
+                        job.pair_w = m.help_w_all; job.bounds = m.help_bounds;
                         job.n_bounds = (int64_t) (nh + 1 + ngh * (MMQ_GROUP + 1));
                         job.flag_x = m.help_flags; job.flag_y = m.help_flags + 1; job.seq = help_seq_l; job.y = m.help_y;
                         stats_.experts_helped += (int64_t) nh;

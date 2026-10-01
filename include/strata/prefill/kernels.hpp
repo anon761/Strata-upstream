@@ -64,9 +64,10 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// *flag = value once the stream's earlier work is done (flag: mapped host memory another device waits on).
 void set_flag(uint32_t* flag, uint32_t value, void* stream);
-/// out[tok[r], :] += w[r] * rows[r, :] for n_rows rows of N (atomic: a token has up to K rows).
-void scatter_rows_weighted(const float* rows, const int32_t* tok, const float* w, int64_t n_rows, float* out,
-                           void* stream);
+/// out[t, :] = sum over k of w[t, k] * rows[pair_row[t, k], :], the pairs with pair_row -1 left out, in k order
+/// (deterministic: the same bits every run), for T tokens of K = 10 pairs and rows of N.
+void sum_rows_by_pair(const float* rows, const int32_t* pair_row, const float* w, int64_t T, float* out,
+                      void* stream);
 /// dst[i] += src[i] for n floats (src: mapped host memory; n a multiple of 4, both 16-byte aligned).
 void add_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]

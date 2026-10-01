@@ -794,12 +794,18 @@ __global__ void set_flag_kernel(uint32_t* flag, uint32_t value) {
     *(volatile uint32_t*) flag = value;
     __threadfence_system();
 }
-__global__ void scatter_rows_weighted_kernel(const float* __restrict__ rows, const int32_t* __restrict__ tok,
-                                             const float* __restrict__ w, int64_t n_rows, float* __restrict__ out) {
+__global__ void sum_rows_by_pair_kernel(const float* __restrict__ rows, const int32_t* __restrict__ pair_row,
+                                        const float* __restrict__ w, int64_t T, float* __restrict__ out) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_rows * N) return;
-    const int64_t r = i / N, d = i % N;
-    atomicAdd(out + (int64_t) tok[r] * N + d, w[r] * rows[i]);
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        const int32_t r = pair_row[t * 10 + k];
+        if (r >= 0) s = fmaf(w[t * 10 + k], rows[(int64_t) r * N + d], s);
+    }
+    out[i] = s;
 }
 __global__ void add_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -813,11 +819,11 @@ void set_flag(uint32_t* flag, uint32_t value, void* stream) {
     set_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("set_flag");
 }
-void scatter_rows_weighted(const float* rows, const int32_t* tok, const float* w, int64_t n_rows, float* out,
-                           void* stream) {
-    if (n_rows <= 0) return;
-    scatter_rows_weighted_kernel<<<blocks_for(n_rows * N), 256, 0, (cudaStream_t) stream>>>(rows, tok, w, n_rows, out);
-    check("scatter_rows_weighted");
+void sum_rows_by_pair(const float* rows, const int32_t* pair_row, const float* w, int64_t T, float* out,
+                      void* stream) {
+    if (T <= 0) return;
+    sum_rows_by_pair_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(rows, pair_row, w, T, out);
+    check("sum_rows_by_pair");
 }
 void add_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
