@@ -46,6 +46,19 @@ FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
 
+
+def emit_progress(phase: str, done: int = 0, total: int = 0, message: str = "") -> None:
+    """Machine-readable progress for the mayaservices loading UI.
+
+    One JSON object per line on stderr, prefixed so the daemon can parse it out
+    of the otherwise human log stream (stdout stays the plain-text summary)."""
+    try:
+        sys.stderr.write("IQPACK_PROGRESS " + json.dumps(
+            {"phase": phase, "done": int(done), "total": int(total), "message": message}) + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 # These small projections are read as BF16 by the residual, router, GDN, QSA and PLE kernels.
 # GSQ-RCO files already store them that way. Ordinary GGUF quants (including OrcaRouter's IQ3_XXS)
 # quantize them too; --compat-bf16 explicitly dequantizes and rounds ONLY these tensors.
@@ -101,7 +114,8 @@ class Model:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
         self.paths = paths
         self.where = {}
-        for p in paths:
+        for i, p in enumerate(paths, 1):
+            emit_progress("shards", i, len(paths), "lese %s" % p.name)
             g = G.GGUFFile(p)
             mm = np.memmap(p, dtype=np.uint8, mode="r")
             for t in g.tensors:
@@ -152,10 +166,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, all_dens
     rows, at = [], 0
     served = 0
     converted = []
+    items = [(n, w) for n, w in model.where.items() if not is_expert(n) and n not in NOT_IN_PACK]
+    total = len(items)
     with open(out / "dense.bin", "wb") as fo:
-        for name, (g, t, mm, _) in model.where.items():
-            if is_expert(t.name) or t.name in NOT_IN_PACK:
-                continue
+        for idx, (name, (g, t, mm, _)) in enumerate(items, 1):
+            emit_progress("dense", idx, total, t.name)
             if len(t.shape) > 2:
                 print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
                 return 1
@@ -305,6 +320,7 @@ def main() -> int:
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
+        emit_progress("tokenizer", 0, 0, "tokenizer exportieren")
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
@@ -316,6 +332,7 @@ def main() -> int:
         return 1
     layout, offset = [], 0
     for l in range(n_layers):
+        emit_progress("experts", l + 1, n_layers, "layer %d" % l)
         ts = [T["blk.%d.ffn_%s_exps.weight" % (l, r)] for r in ROLES]
         per = [t.expected_bytes() // n_expert for t in ts]
         if per[0] != per[1] or ts[0].type_name != ts[1].type_name:
@@ -343,10 +360,12 @@ def main() -> int:
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
+        emit_progress("done", 1, 1, "pack fertig")
         return 0
     path = out / "experts.bin"
     if path.exists() and path.stat().st_size == offset:
         print("experts.bin exists with the right size; not rewritten")
+        emit_progress("done", 1, 1, "pack fertig")
         return 0
     with open(path, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
@@ -354,10 +373,12 @@ def main() -> int:
             chunk = np.concatenate(parts, axis=1)          # (n_expert, blob): gate | up | down per expert
             assert chunk.shape == (n_expert, blob)
             fo.write(chunk.tobytes())
+            emit_progress("experts_bin", l + 1, n_layers, "layer %d" % l)
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
                                                                         off / 2**30), flush=True)
     print("experts.bin: %d layers, %.2f GiB" % (n_layers, offset / 2**30))
+    emit_progress("done", 1, 1, "pack fertig")
     return 0
 
 
