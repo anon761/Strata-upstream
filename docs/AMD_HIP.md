@@ -1,20 +1,23 @@
-# Experimental AMD HIP backend (gfx1100)
+# Experimental AMD HIP backend (gfx1100, gfx1101, gfx1200, gfx1201, gfx1030)
 
-This is a manual Linux source build for the RX 7900 XTX. It is opt-in; the
-NVIDIA installer and CUDA build remain the default. Other AMD architectures,
-wave64, Windows HIP, and mixed AMD/NVIDIA execution are outside this contribution.
+This is a Linux source build for the RX 7900 XT / XTX (RDNA3, gfx1100) and the
+RX 9070 / 9070 XT / Radeon AI PRO R9700 (RDNA4, gfx1201; see [RDNA4](#rdna4-gfx1201)). The RX 7800 XT / 7700 XT
+(gfx1101) and the RX 9060 XT (gfx1200) were validated by their owners (see [Community-validated
+cards](#community-validated-cards)); the RX 6800 / 6900 series (RDNA2, gfx1030) builds and runs too, reported by a community machine and not yet validated by the maintainers (see [RDNA2](#rdna2-gfx1030)). It is opt-in; the NVIDIA installer and CUDA build remain the default. Other AMD
+architectures, wave64, Windows HIP, and mixed AMD/NVIDIA execution are outside this contribution.
 
 The backend maps the CUDA-shaped runtime and BLAS calls to HIP/hipBLAS, uses
-RDNA3's signed integer dot instruction for quantized kernels, and supplies
+RDNA2/RDNA3/RDNA4's signed integer dot instruction for quantized kernels, and supplies
 wave32 shuffle/packed-byte operations. CUDA-only QSA matrix instructions have
 an ordered FP32 fallback. Prefill supports both dequantization plus hipBLAS GEMM and opt-in HIP ggml MMQ.
-An optional, calibrated hipBLASLt path accelerates dense projections on gfx1100.
+An optional, calibrated hipBLASLt path accelerates dense projections (per-architecture tables in `tools/hip`).
 This does not claim bit-identical model answers across backends. See
 [performance settings and evidence](AMD_HIP_PERFORMANCE.md).
 
 ## Install with setup (recommended)
 
-On Linux with an RX 7900 XT / XTX and the kernel's amdgpu driver (no ROCm install needed):
+On Linux with an RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT or Radeon AI PRO R9700 and
+the kernel's amdgpu driver (no ROCm install needed):
 
 ```sh
 ./setup.sh --backend hip
@@ -22,12 +25,27 @@ On Linux with an RX 7900 XT / XTX and the kernel's amdgpu driver (no ROCm instal
 
 - **Detection:** setup finds the card through the kernel's KFD topology. Integrated Radeon GPUs are listed as not
   supported. On a PC without an NVIDIA card Strata can use, `--backend hip` is chosen automatically.
-- **ROCm:** installed into `.venv` from AMD's TheRock wheels (~10 GB, no sudo), pinned to the version this backend was
-  tested with (`STRATA_ROCM_VERSION` / `STRATA_ROCM_INDEX` override it). A system ROCm in `/opt/rocm` (or
-  `$ROCM_PATH`) with hipcc and hipBLAS is used instead when present.
-- **Engine:** compiled on your PC (10-20 minutes, once; again after a `git pull` that changes it). This needs a C++
-  compiler and git (`sudo apt install build-essential git`).
-- **Limits for now:** one GPU, no images, no calibration. The Monitor shows no GPU statistics.
+- **ROCm:** a system ROCm 7 in `/opt/rocm` (or `$ROCM_PATH`) with hipcc and hipBLAS is used when present. Otherwise
+  (or when it is older than 7.0) ROCm is installed into `.venv` from AMD's TheRock wheels (~10 GB, no sudo), pinned
+  to the version this backend was tested with, from the card family's index: `gfx110X-dgpu` for gfx1100 / gfx1101,
+  `gfx120X-all` for gfx1200 / gfx1201, `gfx103X-all` for gfx1030 (`STRATA_ROCM_VERSION` /
+  `STRATA_ROCM_INDEX` override them; the gfx1030 index is not checked to carry the pinned version: a system
+  ROCm 7 is the tested path there).
+- **Engine:** compiled on your PC for the card's architecture (10-20 minutes, once; again after a `git pull` that
+  changes it, or when you pick a card of another architecture). This needs a C++ compiler and git
+  (`sudo apt install build-essential git`).
+- **hipBLASLt tuning table:** setup uses `tools/hip/<arch>-hipblaslt-<version>.txt` only when it matches both the
+  card's architecture and the installed hipBLASLt version (read from `hipblaslt-version.h`; 1.2.0 is `100200`).
+  Otherwise it says so and the prompt's dense matrix products use plain hipBLAS (slower prompts, same answers).
+  A table's solution ids are valid only for that pair, and the engine refuses any other table.
+- **Several cards:** setup takes one card (the one with the most VRAM, or `--gpu N`) unless you name more:
+  `./setup.sh --backend hip --gpus 1,0` splits the model's layers across them, the first one the main card (numbers
+  as setup lists them; `--gpus all` = every supported card, the most VRAM first). Every chosen card must be one of the
+  architectures above; the engine is compiled for each of them (cards of two families, e.g. gfx1100 + gfx1201, need
+  a system ROCm 7: AMD's wheels hold one family). A split pays only when no single card holds the model's experts
+  (see RDNA4 below).
+- **Limits for now:** images only through the CPU encoder (`--vision cpu`, 0.1.32), no calibration. The Monitor
+  shows the card's load, VRAM, temperature and power from Linux sysfs (0.1.32).
 
 The rest of setup is the same as on NVIDIA: the model download, the start script, the server.
 
@@ -45,6 +63,13 @@ cmake -S . -B build-hip \
   -DCMAKE_HIP_ARCHITECTURES=gfx1100
 cmake --build build-hip --target strata -j2
 ```
+
+`CMAKE_HIP_ARCHITECTURES` is `gfx1100`, `gfx1101`, `gfx1200`, `gfx1201`, or a list such as `"gfx1100;gfx1201"`
+(one binary for both). gfx1102 (the same wave32, 64 KiB LDS and dot4 instruction) builds with a warning: it passed
+ctest (#192) but no model run has been reported; so does gfx1030 (RDNA2: the older `v_dot4_i32_i8`, a community run in #311). At startup the engine and `strata-device` compare each GPU they use
+(`gcnArchName` up to the `:` feature suffix) with the architectures the binary was compiled for, and require
+wave32. A binary carried to another card stops with the card's name, its architecture and the build's list,
+instead of failing later with "invalid device function".
 
 If CMake cannot find the HIP compiler, add
 `-DCMAKE_HIP_COMPILER=/path/to/rocm/llvm/bin/clang++`. On the Fedora-family test
@@ -98,8 +123,170 @@ The worker count above was used on a 16-core CPU; measure it for your CPU.
 The 4K context is a smoke-test starting point, not a model limit. The expert cache
 sizes itself automatically and leaves 1 GiB of VRAM headroom.
 
-The installer supports this backend (see "Install with setup" above). The vision helper and multi-GPU layer
-splits are NVIDIA-only for now.
+The installer supports this backend (see "Install with setup" above). The vision helper is NVIDIA-only for now.
+Setup installs one AMD card, or several with `--gpus` (the engine's layer split; see RDNA4 below).
+
+## RDNA4 (gfx1201)
+
+The RX 9070 / 9070 XT and the Radeon AI PRO R9700 run the same kernels as gfx1100: wave32, 64 KiB of LDS per
+workgroup, the signed dot4 instruction (`v_dot4_i32_iu8` through `__builtin_amdgcn_sudot4`) and a 100 MHz wall
+clock. The first report and patch came from doplxyz (#178). Validated on 2026-09-30 on doplxyz's test machine:
+an RX 9070 XT 16 GB and a Radeon AI PRO R9700 32 GB (both gfx1201), a Ryzen 9 3900X (16 threads, no AVX-512),
+47 GB RAM, Ubuntu 24.04 in a KVM/VFIO guest.
+
+- **Build:** complete HIP build with tests (`-DCMAKE_HIP_ARCHITECTURES=gfx1201 -DSTRATA_BUILD_TESTS=ON
+  -DSTRATA_PREFILL_MMQ=ON`), with the system ROCm 7.14 (hipBLASLt 1.4.1) and with setup's own path: TheRock
+  7.10.0a20251120 wheels from `gfx120X-all` (hipBLASLt 1.2.0) and `build_engine_hip`.
+- **ctest** (all 45 registered tests, R9700): 42 pass, `hip_prefill_hipblaslt_gemm` skips (no table), and two
+  fail for reasons outside the GPU: `ple_parity` needs the Q2_0 model fixture, `expert_multi_test` needs an
+  AVX-512 CPU. `hip_handoff` needed the volatile ring store: on gfx1201 a plain store to mapped pinned memory
+  stays in the GPU's L2 until the stream is synchronized.
+- **Arch check:** a gfx1100-only build stops on the gfx1201 card at startup with the message above (engine and
+  `strata-device`).
+- **End to end** (Coder IQ1_M, setup's arguments: `--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5`,
+  MTP, `--kv int8`, `--max-context 32768`; 128 greedy tokens, system ROCm 7.14, no hipBLASLt table). The answers
+  are coherent and the same on both cards. The live server smoke (`serve/server.py`: web page, models, props,
+  chat, prefix reuse, streaming, the Anthropic endpoint, a sampled code answer) passed 9/9 on each card.
+
+  | card | expert cache | peak VRAM | 4K prompt | 4K decode | 16K prompt | 16K decode |
+  |---|---|---|---|---|---|---|
+  | Radeon AI PRO R9700 32 GB | 12,288 slots, 23.4 GiB | 29.7 GiB | 982 tok/s | 45.5 tok/s | 1,402 tok/s | 48.3 tok/s |
+  | RX 9070 XT 16 GB | 4,931 slots, 9.4 GiB | 15.6 GiB | 782 tok/s | 30.8 tok/s | 1,235 tok/s | 35.4 tok/s |
+  | R9700, TheRock 7.10 wheels | 12,288 slots | | 957 tok/s | 44.2 tok/s | 1,284 tok/s | 43.9 tok/s |
+
+  The engine's resident memory was about 26 GB in every run. Since 0.1.31 `__byte_perm` is one `v_perm_b32` and the
+  packed byte subtracts/compare work on four lanes at once (#262, ttio2tech): decode +15% on the R9700 (46.0 -> 53.0
+  tok/s on a 4K prompt, 52.0 -> 60.5 warm) and +5-7% on the 9070 XT, prompts unchanged, the same tokens.
+- **hipBLASLt:** the validation above used hipBLASLt 1.4.1. A table calibrated on the R9700 at the engine's shapes
+  with that version (0.98-1.76x per GEMM over hipBLAS) changed the end-to-end prompt speed by 0-3%, within noise,
+  so none was shipped for it: there the plain hipBLAS path is already close. For hipBLASLt 1.5.0 (ROCm
+  10.2.0a nightly) `tools/hip/gfx1201-hipblaslt-100500.txt` is shipped (see "Tuning table" below); on one R9700 it
+  measured +3.9% prompt speed on 4,210-token prompts (1,590 vs 1,531 tok/s), a modest gain.
+- **Both cards in one run (layer split, engine 0.1.30):** the config's `"backend": "hip", "gpu": [1, 0]` (R9700
+  first) runs through `serve/server.py` (setup writes it with `--gpus 1,0` since 0.1.31). Auto split put layers 0-27 on the R9700 and
+  28-47 on the 9070 XT. With every expert on the GPUs the split gives exactly the tokens of the R9700 alone (4K and
+  16K prompts); checkpoints on the split (second turn, rewind, a prompt sharing a prefix, a cancelled prompt
+  retried) give exactly the tokens of a fresh read. The conversation cache refuses a split at start (exit 2).
+  On this pair the split does not pay: the R9700 alone already holds all 12,288 expert pairs.
+
+  | run (the same session, warm) | 4K prompt | 16K prompt | decode |
+  |---|---|---|---|
+  | R9700 alone | 1,794 tok/s | 1,804 tok/s | 51-52 tok/s |
+  | R9700 + 9070 XT, auto split | 1,384 tok/s | 1,906 tok/s | 42-43 tok/s |
+  | RX 9070 XT alone | 1,016 tok/s | 1,519 tok/s | 38-40 tok/s |
+
+  A split is worth it when no single card holds the model's experts. Since 0.1.31 a split pins the whole expert
+  arena on Linux (the 8 GiB cap is for Windows/WSL2 only, #253): with an expert cache of 1,500 on the R9700 (most
+  experts streamed) the split read a 16K prompt at 1,803 tok/s instead of 1,287, with the same tokens in 5 + 5
+  starts. `"split_skip_if_fits": true` in the config (0.1.31, opt-in) runs such a pair on the first card alone when it
+  holds every profiled expert: with the R9700 first, 4K prompts 1,776 tok/s (split: 1,244) and decode ~60 tok/s
+  (split: ~51), the tokens of the R9700 alone (docs/MULTI_GPU.md).
+- **Speed switches (engine 0.1.32, measured on the R9700 / 9070 XT with the Coder IQ1_M pack):**
+  - the MoE router (`router_top10`) runs a HIP kernel without its serial FP64 sum and block barriers by default: the
+    same ids and weights bit for bit (`hip_router_fast` checks 65,536 rows), 39 -> 9-12 us per call, decode
+    62.4 -> 70.0 tok/s on the R9700 and +4% on the 9070 XT, the same greedy tokens (5 + 5 starts).
+    `STRATA_HIP_ROUTER_OLD=1` runs the portable kernel.
+  - `STRATA_HIP_WMMA=1` (opt-in, gfx12 only, int8 KV): the prompt path's QSA attention on RDNA4 matrix cores
+    (`v_wmma_f32_16x16x16_f16`, FP16 hi + lo halves like the CUDA tensor-core kernel; `hip_prompt_attn_wmma` bounds it
+    against the FP32 kernel and FP64). 7.2-7.5x the portable kernel; R9700 prompts 4K 1,784 -> 2,427 tok/s, 16K
+    1,797 -> 2,700. Not bitwise: greedy text differs from token ~50 on, as with the CUDA tensor-core attention. With it
+    the prompt path's expert ring is 96 slots (as STRATA_PREFILL_RING=96): with the default 384 the 9070 XT's 4K
+    prompts fell to 718 tok/s; with 96 they gain (1,017 -> 1,211; 16K 1,518 -> 2,032). PR #329
+    (bsorensen110) contributed an equivalent gfx12 WMMA kernel of the same speed (within 1%); this one also masks KV
+    pages that KV streaming has not made resident, as the decode kernel does.
+  - The prompt path's QSA top-k picks its kernel by the blocks a query actually has, not the cache's capacity (#337,
+    bsorensen110): the same ids, on by default with AMD (NVIDIA keeps its capacity rule: there the 64K prompts read
+    1-3% slower with it). `STRATA_SELECT_WMMA=1` (opt-in, gfx12) adds #337's
+    matrix-core block scorer; it selects slightly differently (254 of 256 queries the same) and gained +1.5% on 16K
+    prompts at a 262K context on the R9700.
+- **Known:** rarely (about 1 start in 10) a HIP run's greedy output differs from another start's at some token, on
+  one card or two and on engine 0.1.29 as well; not yet explained.
+- **Not validated:** images, long contexts beyond 16K, answer-quality benchmarks.
+
+## Community-validated cards
+
+Run by their owners, not on the maintainers' machines; setup accepts them like gfx1100 / gfx1201. No hipBLASLt table
+is shipped for them (make one with [Tuning table](#tuning-table) and compare the prompt speed with and without it).
+
+- **gfx1101, RX 7800 XT 16 GB** (jhohertz, #254; engine 0.1.29, Ryzen 9 5950X, 121 GiB RAM, system ROCm with
+  hipBLASLt 1.4.1): `./setup.sh --backend hip` detected the card and compiled the engine; `strata-device --selftest`
+  passed; ctest 30/32 (`ple_parity` needs the Q2_0 fixture, `platform_memory_test` the memlock limit). Coder IQ1_M,
+  64K context, MTP, with a table the owner calibrated: fresh prompts of 4K-9K tokens at 898-953 tok/s, decode
+  38-44 tok/s (128 tokens).
+- **gfx1200, RX 9060 XT 16 GB** (Efeisot, #256 after #176; engine 0.1.29, Ryzen 9 7950X, 64 GiB RAM, ROCm 7.2 with
+  hipBLASLt 1.2.2): ctest 32/32 (without `ple_parity` and `platform_memory_test`). Coder IQ1_M, greedy, MTP
+  `--spec 4 --spec-min-p 0.5`, with a table the owner calibrated:
+
+  | prompt | prompt speed | decode |
+  |---|---|---|
+  | 2,374 tokens | 540 tok/s | 27.1 tok/s (0.69 draft acceptance; 31.0 at 1.00) |
+  | 65K (`--kv int8 --kv-resident 65536 --prefill 16384`) | 748-753 tok/s | 26-40 tok/s by acceptance |
+  | 130K (the same flags) | 725 tok/s | - |
+
+  Greedy output was the same across runs. For comparison, llama.cpp's HIP build measured 20 tok/s decode and
+  450 tok/s prompt on that card.
+
+## RDNA2 (gfx1030)
+
+The RX 6800 / 6800 XT / 6900 XT / 6950 XT run the same kernels: wave32 and 64 KiB of LDS per workgroup. The one
+difference is the dot instruction: RDNA2 has no `v_dot4_i32_iu8` (gfx11 and newer), so
+`dp4a` uses the plain signed `v_dot4_i32_i8` through `__builtin_amdgcn_sdot4`, which compiles to a single
+`v_dot4c_i32_i8` (same signed x signed byte products, modulo 2^32). There is no WMMA; the QSA scorer takes the
+same ordered FP32 fallback as gfx1100. CMake lists gfx1030 as unvalidated (the build warns) until a maintainer has
+run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx1030), an i7-13700KF (8 P-cores and
+8 E-cores, AVX2, no AVX-512), 63 GB RAM, NixOS, ROCm 7.2.3 from nixpkgs (clang 22, hipBLAS 3.2).
+
+- **Build and tests** (engine 0.1.26): a complete HIP build for gfx1030, made by hand with cmake and ROCm's own
+  `clang++` (the nixpkgs ROCm is not an `/opt/rocm` tree, so setup's `build_engine_hip` was not exercised; the
+  binary was placed in `engine/` for setup to use). All 28 registered ctest tests pass on the card, including
+  `hip_device_selftest`. An engine 0.1.30 build of this branch configures, builds and runs clean on the same card;
+  the speeds below are measured on it.
+- **End to end** (Swift 1.5 IQ3_XXS, `--context 131072` with `--kv-resident 32768 --adapt-every 1
+  --vram-reserve-mib 1024`, 200 greedy tokens): 38-42 tok/s decode with the default 15 CPU pool workers (one per
+  physical core except the host thread; 8 workers: 36; 24 = every logical core: 27), consistent even with the
+  131,072-token context full.
+- **Prefill** (the same 15-worker configuration): 246 tok/s on a 2,000-token prompt, 330-339 tok/s at the auto
+  8,192-token chunk (7,997 and 15,967 tokens; time to first token 8.9 and 48.3 s), 133 tok/s on a 522-token
+  prompt - short prompts are fixed overhead (19-25 tok/s on 34 tokens). Decode after a 16K prefill holds at
+  45.5 tok/s.
+- **16 GB card:** the expert cache holds 6,310 slots (10.2 GiB) at 16K context and 5,247 slots at 131,072, where
+  setup keeps the KV cache in VRAM because IQ3_XXS needs about 60 GB of RAM plus the cache to stream it. The
+  `--pcie-frac 0` and `--adapt-every 0` of the 7900 XTX configuration in
+  [AMD_HIP_PERFORMANCE.md](AMD_HIP_PERFORMANCE.md) cost 8.6 and 13.6 tok/s here (30 with the defaults): keep the
+  defaults on a 16 GB card.
+- **hipBLASLt:** ROCm's hipBLASLt ships no gfx1030 kernels, so there is no table and the plain hipBLAS path runs.
+- **Not validated:** gfx1031 / gfx1032 (the same `dp4a` path, no hardware report), setup's own build path and the
+  `gfx103X-all` wheels on gfx1030, images, answer-quality benchmarks.
+
+## Tuning table
+
+A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it
+is calibrated on the card with the ROCm the engine runs with. The shipped gfx1100 table's rows are the engine's
+dense GEMM shapes; to calibrate them for another card or version (a few minutes):
+
+```sh
+cmake --build build-hip --target tune_hipblaslt
+CASES=$(awk 'NR>2 {printf " --case %s,%s,%s,%s,%s", $1, $5, $2, $3, $4}' tools/hip/gfx1100-hipblaslt-100200.txt)
+./build-hip/tune_hipblaslt $CASES --tuning-out table.txt
+```
+
+The file's second line names the architecture and version (`STRATA_HIPBLASLT_TUNING_V1 gfx1201 100401`); save it
+as `tools/hip/<arch>-hipblaslt-<version>.txt` for setup, or point `STRATA_HIPBLASLT_TUNING` at it. Compare the
+prompt speed with and without it before keeping it.
+
+Shipped tables:
+
+- `gfx1100-hipblaslt-100100.txt`, `gfx1100-hipblaslt-100200.txt`: RX 7900 XTX.
+- `gfx1201-hipblaslt-100500.txt`: Radeon AI PRO R9700 (gfx1201, 32 GB), calibrated with ROCm 10.2.0a20260914
+  (AMD's `gfx120X-all` nightly, hipBLASLt 1.5.0, library build `d3164197`). 16 dense GEMM geometries at T=4096 and
+  T=8192, 32 rows. setup uses it only when the installed hipBLASLt reports 1.5.0 (it is found in `/opt/rocm`
+  when that is a system ROCm 7 or newer). The version number is the only thing the engine can check, so another
+  1.5.0 build could number its solutions differently. `hip_prefill_hipblaslt_gemm` (with `STRATA_HIPBLASLT_TUNING`
+  set) is a smoke test: it refuses a table for another architecture or version and checks that one BF16 and one
+  F16 row exist and agree with hipBLASEx, which covers 2 of the 32 rows. It does not prove that a solution id is
+  valid: the engine falls back to hipBLASEx for an id the library rejects, and the test still passes. Run it with
+  `STRATA_HIPBLASLT_VERBOSE=1` and look for `fallbacks=0` in its summary line, and recalibrate with
+  `tune_hipblaslt` before using this table with a different 1.5.0 build.
 
 ## Original backend validation (PR #94)
 

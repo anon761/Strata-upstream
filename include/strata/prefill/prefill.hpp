@@ -31,7 +31,6 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
-    int64_t experts_helped = 0;     ///< ...streamed and computed by the other stage's GPU (a layer split's help)
     double ms_ple = 0;
 };
 
@@ -53,6 +52,11 @@ public:
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
+    /// Frees every buffer, stream and event `init` made (as the destructor does) and starts over empty, so `init` can
+    /// run again - with a smaller chunk when the first one did not fit.  The stage range (`set_stage`) and the
+    /// callbacks stay.  The device `init` ran on must be current.
+    void reset();
+
     /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
     /// `borrow`/`borrow_bytes`: device memory to carve every buffer from (the top slots of the expert cache,
     /// lent for the prompt and refilled after it); null = allocate normally.
@@ -69,6 +73,9 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
+    /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
+    static void set_ring_override(int slots);
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
@@ -105,21 +112,13 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
-    /// LAYER SPLIT: the other stage's prompt path.  A prompt that fits one chunk runs the stages one after the
-    /// other, so one GPU and its PCIe link idle while the other streams its non-resident experts: the idle one
-    /// streams and computes part of them over its own link, and hands back each token's weighted sum.  Both
-    /// stages must have run `init`.  STRATA_PREFILL_HELP=0 turns it off.
-    void set_helper(Prefill* helper) { helper_ = helper; }
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
-    Prefill* helper_ = nullptr;
-    bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (the stage before idles now)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
-    struct HelpJob;
-    bool help_layer(const HelpJob& job, std::string& err);   // run on the helper's device and buffers
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
