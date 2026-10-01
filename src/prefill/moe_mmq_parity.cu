@@ -58,8 +58,10 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     cudaStreamCreate(&s);
     void *dgu, *dxq, *dbounds, *dids;
-    float* ddst;
+    float *ddst, *dx;
     cudaMalloc(&dgu, gub.size());
+    cudaMalloc((void**) &dx, x.size() * 4);
+    cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
     cudaMalloc(&dxq, strata::prefill::mmq::q8_bytes(T, H));
     cudaMalloc(&dbounds, 2 * 4);
     cudaMalloc(&dids, T * 4);
@@ -68,7 +70,7 @@ int main(int argc, char** argv) {
     const int32_t hb[2] = {0, (int32_t) T}, ids[T] = {0, 1, 2, 3};
     cudaMemcpy(dbounds, hb, 8, cudaMemcpyHostToDevice);
     cudaMemcpy(dids, ids, T * 4, cudaMemcpyHostToDevice);
-    strata::prefill::mmq::quantize(x.data(), nullptr, dxq, gu_type, H, H, T, s);
+    strata::prefill::mmq::quantize(dx, nullptr, dxq, gu_type, H, H, T, s);
     strata::prefill::mmq::Context ctx;
     strata::prefill::mmq::Product p;
     p.w = dgu;
@@ -100,7 +102,7 @@ int main(int argc, char** argv) {
     const double e = rel(got, ref);
     std::printf("layer %d gate/up %s: MMQ rel %.2e %s\n", layer, ggml_type_name((ggml_type) gu_type), e,
                 e < 3e-2 ? "ok" : "FAIL");
-    cudaFree(dgu); cudaFree(dxq); cudaFree(dbounds); cudaFree(dids); cudaFree(ddst);
+    cudaFree(dgu); cudaFree(dxq); cudaFree(ddst); cudaFree(dx);
 
     // the down product (Q5_1/Q8_0 in the ordinary files), exactly as prefill.cpp sets it up
     const int d_type = (int) td->type;
@@ -112,12 +114,14 @@ int main(int argc, char** argv) {
     std::vector<float> h((size_t) T * FF);
     for (auto& v : h) v = nd(rng);
     void *dd, *dhq;
-    float* ddout;
+    float *ddout, *dh;
     cudaMalloc(&dd, d_bytes);
+    cudaMalloc((void**) &dh, h.size() * 4);
+    cudaMemcpy(dh, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
     cudaMalloc(&dhq, strata::prefill::mmq::q8_bytes(T, FF));
     cudaMalloc((void**) &ddout, (size_t) H * T * 4);
     cudaMemcpy(dd, gguf.tensor_data(*td), d_bytes, cudaMemcpyHostToDevice);
-    strata::prefill::mmq::quantize(h.data(), nullptr, dhq, d_type, FF, FF, T, s);
+    strata::prefill::mmq::quantize(dh, nullptr, dhq, d_type, FF, FF, T, s);
     strata::prefill::mmq::Product dp;
     dp.w = dd;
     dp.type = d_type;
@@ -146,7 +150,7 @@ int main(int argc, char** argv) {
     const double ed = rel(gotd, refd);
     std::printf("layer %d down %s: MMQ rel %.2e %s  got[0]=%.4f ref[0]=%.4f got[1]=%.4f ref[1]=%.4f\n", layer,
                 ggml_type_name((ggml_type) d_type), ed, ed < 3e-2 ? "ok" : "FAIL", gotd[0], refd[0], gotd[1], refd[1]);
-    cudaFree(dd); cudaFree(dhq); cudaFree(ddout);
+    cudaFree(dd); cudaFree(dhq); cudaFree(ddout); cudaFree(dh); cudaFree(dbounds); cudaFree(dids);
 
     // the dense projection path (native_mmvq), e.g. an ordinary file's Q8_0 attention/shexp weight and the head
     {

@@ -74,9 +74,6 @@ with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
 
 ## Known issues / limitations
 
-- **`Q5_1`'s MMQ case faults** (an illegal memory access) at the pinned llama.cpp commit on sm_86. The fork
-  therefore leaves `Q5_1` out of `mmq::supported` and routes `Q5_1`-down layers through the **FP16 dequant** path
-  (correct, and here faster than MMQ-with-`Q8_0`-down, which streams larger blobs).
 - **Single GPU in an LXC** can fail `cublasCreate` when the expert cache fills VRAM (container pinning limits).
   The 2-GPU layer split is the supported configuration.
 - The upstream `--expert-cache-per-layer` policy aborts on native packs with mixed blob sizes; not used here.

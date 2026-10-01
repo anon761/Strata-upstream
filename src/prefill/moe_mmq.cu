@@ -96,11 +96,9 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
         // ordinary GGUFs: llama.cpp's MMQ covers the K-quants and the small-block quants; a native expert
         // blob's gate/up are 256-block (Q4_K) and the down matrix is 32-block (Q5_1/...) for a 640-wide n_ff
-        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
             return true;
-        // Q5_1 is deliberately left out: its MMQ case reads back zeros here (verified by src/prefill/moe_mmq_parity),
-        // so a layer whose down matrix is Q5_1 takes the FP16 dequant path instead (correct, a little slower).
         default:
             return false;
     }
