@@ -91,10 +91,24 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
         note = "hugetlb 2 MB pages";
         return p;
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
-    p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // No hugetlb pool: a 2 MB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back it
+    // where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of this
+    // arena; with 4 KB pages every 3 MB expert costs ~750 TLB misses.
+    constexpr uint64_t kAlign = 2ull << 20;
+    const uint64_t padded = bytes + kAlign;
+    void* raw = mmap(nullptr, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    if (raw == MAP_FAILED) return nullptr;
+    const uintptr_t start = (uintptr_t) raw, aligned = (start + kAlign - 1) & ~(uintptr_t) (kAlign - 1);
+    if (aligned > start) munmap(raw, aligned - start);
+    if (const uintptr_t end = aligned + bytes, raw_end = start + padded; raw_end > end)
+        munmap((void*) end, raw_end - end);
+    p = (void*) aligned;
+    if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && madvise(p, bytes, MADV_HUGEPAGE) == 0)
+        note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); transparent huge pages requested";
+    else
+        note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+    return p;
 #endif
 }
 
