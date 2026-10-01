@@ -3155,6 +3155,11 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
+        if (multi_gpu) {   // a prompt of one chunk: the idle neighbour streams part of each stage's experts
+            std::vector<strata::prefill::Prefill*> paths{&sp};
+            for (const auto& st : stages) paths.push_back(&st->sp);
+            for (size_t i = 0; i < paths.size(); ++i) paths[i]->set_helper(paths[i + 1 < paths.size() ? i + 1 : i - 1]);
+        }
         mem_mark("the head and the prompt path");
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for

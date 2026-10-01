@@ -58,6 +58,13 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// *flag = value once the stream's earlier work is done (flag: mapped host memory another device waits on).
+void set_flag(uint32_t* flag, uint32_t value, void* stream);
+/// out[tok[r], :] += w[r] * rows[r, :] for n_rows rows of N (atomic: a token has up to K rows).
+void scatter_rows_weighted(const float* rows, const int32_t* tok, const float* w, int64_t n_rows, float* out,
+                           void* stream);
+/// dst[i] += src[i] for n floats (src: mapped host memory; n a multiple of 4, both 16-byte aligned).
+void add_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);

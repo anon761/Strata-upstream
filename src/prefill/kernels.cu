@@ -673,6 +673,43 @@ __global__ void copy_i32_kernel(int32_t* __restrict__ dst, const int32_t* __rest
         dst[i] = src[i];
 }
 }  // namespace
+namespace {
+__global__ void set_flag_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
+    __threadfence_system();
+}
+__global__ void scatter_rows_weighted_kernel(const float* __restrict__ rows, const int32_t* __restrict__ tok,
+                                             const float* __restrict__ w, int64_t n_rows, float* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_rows * N) return;
+    const int64_t r = i / N, d = i % N;
+    atomicAdd(out + (int64_t) tok[r] * N + d, w[r] * rows[i]);
+}
+__global__ void add_from_mapped_kernel(float4* __restrict__ dst, const volatile float4* src, int64_t n4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n4) return;
+    const float4 a = dst[i];
+    const float4 b = const_cast<const float4&>(src[i]);
+    dst[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+}  // namespace
+void set_flag(uint32_t* flag, uint32_t value, void* stream) {
+    set_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("set_flag");
+}
+void scatter_rows_weighted(const float* rows, const int32_t* tok, const float* w, int64_t n_rows, float* out,
+                           void* stream) {
+    if (n_rows <= 0) return;
+    scatter_rows_weighted_kernel<<<blocks_for(n_rows * N), 256, 0, (cudaStream_t) stream>>>(rows, tok, w, n_rows, out);
+    check("scatter_rows_weighted");
+}
+void add_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    add_from_mapped_kernel<<<blocks_for(n / 4), 256, 0, (cudaStream_t) stream>>>(
+        (float4*) dst, (const volatile float4*) src, n / 4);
+    check("add_from_mapped");
+}
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
     const int64_t b = (n + 255) / 256;

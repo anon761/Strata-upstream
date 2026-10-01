@@ -31,6 +31,7 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    int64_t experts_helped = 0;     ///< ...streamed and computed by the other stage's GPU (a layer split's help)
     double ms_ple = 0;
 };
 
@@ -104,11 +105,20 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// LAYER SPLIT: the other stage's prompt path.  A prompt that fits one chunk runs the stages one after the
+    /// other, so one GPU and its PCIe link idle while the other streams its non-resident experts: the idle one
+    /// streams and computes part of them over its own link, and hands back each token's weighted sum.  Both
+    /// stages must have run `init`.  STRATA_PREFILL_HELP=0 turns it off.
+    void set_helper(Prefill* helper) { helper_ = helper; }
 
 private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    Prefill* helper_ = nullptr;
+    bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (the stage before idles now)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    struct HelpJob;
+    bool help_layer(const HelpJob& job, std::string& err);   // run on the helper's device and buffers
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
     std::unique_ptr<Impl> impl_;
