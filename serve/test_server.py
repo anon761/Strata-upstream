@@ -369,6 +369,65 @@ class RecordingPrompt(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class PairTokenizer(ByteTokenizer):
+    """ByteTokenizer whose canonical split joins "ab" into one id (300), as BPE merges: "ab" has two token spellings."""
+
+    def encode(self, text, parse_special=False):
+        out = []
+        for t in super().encode(text, parse_special):
+            if out and out[-1] == ord("a") and t == ord("b"):
+                out[-1] = 300
+            else:
+                out.append(t)
+        return out
+
+    def decode(self, ids, errors="replace"):
+        return super().decode([x for t in ids for x in ((ord("a"), ord("b")) if t == 300 else (t,))], errors)
+
+
+class SplitEngine(MockEngine):
+    """Generates "ab" as two ids, the non-canonical spelling a model may sample."""
+
+    def __init__(self, tokenizer, max_context):
+        super().__init__(tokenizer, "", max_context=max_context)
+        self.script = [ord("a"), ord("b"), ord(" "), ord("x")] + tokenizer.encode("<|im_end|>", parse_special=True)
+
+
+class SessionTokens(unittest.TestCase):
+    """A follow-up starts with the ids the engine's live session holds, not a fresh split of the same text."""
+
+    def ask(self, svc, messages):
+        ids, thinking, max_new = svc.prepare(messages, None, {"enable_thinking": False}, 16)
+        for _ in svc.run(ids, thinking, None, max_new, {}, threading.Event()):
+            pass
+        return ids
+
+    def test_follow_up_reuses_the_generated_ids(self):
+        tok = PairTokenizer()
+        eng = SplitEngine(tok, CTX)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        first = [{"role": "user", "content": "hi"}]
+        ids1 = self.ask(svc, first)
+        live = ids1 + eng.script
+        follow = first + [{"role": "assistant", "content": "ab x"}, {"role": "user", "content": "more"}]
+        ids2 = self.ask(svc, follow)
+        self.assertEqual(ids2[:len(live)], live)
+        self.assertEqual(tok.decode(ids2), svc.template.render(follow, enable_thinking=False))
+        # a fresh server has no session: the same text in its canonical split
+        fresh = Service(SplitEngine(tok, CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertIn(300, self.ask(fresh, follow))
+
+    def test_a_cancelled_answer_is_no_session(self):
+        tok = PairTokenizer()
+        svc = Service(SplitEngine(tok, CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids, thinking, max_new = svc.prepare([{"role": "user", "content": "hi"}], None, {"enable_thinking": False}, 16)
+        cancel = threading.Event()
+        cancel.set()
+        for _ in svc.run(ids, thinking, None, max_new, {}, cancel):
+            pass
+        self.assertIsNone(svc.session)
+
+
 class DyingEngine(MockEngine):
     """Issue #27: an engine that dies after a few tokens of its first answer, and comes back when restarted."""
 

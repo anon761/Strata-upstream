@@ -575,6 +575,10 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
+        # The engine resumes a prompt from its live session only token for token, and a model's own tokens are not
+        # always the tokenizer's split of the same text: the last finished request's ids (prompt + generated) and
+        # their text, so a follow-up that renders that text again starts with those very ids (prepare).
+        self.session = None
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
@@ -719,9 +723,13 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
         prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
+        session = self.session
+        if not images and session is not None and len(prompt) > len(session[1]) and prompt.startswith(session[1]):
+            ids = session[0] + self.tok.encode(prompt[len(session[1]):], parse_special=True)
+        else:
+            ids = self.tok.encode(prompt, parse_special=True)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -804,6 +812,17 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    def _session_of(self, ids, raw_ids):
+        """(ids, text) of a finished request's prompt and answer; None when they do not decode to text exactly (a
+        UTF-8 character split by the token limit)."""
+        if not raw_ids:
+            return None
+        full = list(ids) + raw_ids
+        try:
+            return full, self.tok.decode(full, errors="strict")
+        except UnicodeDecodeError:
+            return None
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -880,6 +899,8 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            # what the engine's live session now holds (an image's ids stand for embeddings: no text to match)
+            self.session = self._session_of(ids, raw_ids) if finish in ("stop", "length") and not emb else None
             with self.status_lock:
                 if self.status.get("busy"):
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
