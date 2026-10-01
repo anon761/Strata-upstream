@@ -55,6 +55,14 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import gguf_reader as G  # noqa: E402
 
+
+def emit_progress(phase: str, done: int = 0, total: int = 0, message: str = "") -> None:
+    """Machine-readable progress for a driver's progress bar (mayaservices' pack build): one JSON object per line on
+    stderr, prefixed so it can be parsed out of the human log; stdout keeps the plain-text summary."""
+    sys.stderr.write("IQPACK_PROGRESS " + json.dumps({"phase": phase, "done": int(done), "total": int(total),
+                                                      "message": message}) + "\n")
+    sys.stderr.flush()
+
 FLOAT = {"BF16", "F32", "F16"}
 ROUTERS = ("ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight")
 NOT_IN_PACK = {"per_layer_token_embd.weight"}      # the 28.8 GB PLE table: read from its GGUF by the engine
@@ -153,7 +161,10 @@ class Model:
         if missing:
             raise FileNotFoundError("missing model shards (wait for the download): " + ", ".join(missing))
         self.paths = paths
-        self.files = [G.GGUFFile(p) for p in paths]
+        self.files = []
+        for i, p in enumerate(paths, 1):
+            emit_progress("shards", i, len(paths), "reading %s" % p.name)
+            self.files.append(G.GGUFFile(p))
         self.sizes = [p.stat().st_size for p in paths]
         check_split(self.files)
         self.where = {}
@@ -275,9 +286,13 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     """Every non-expert tensor of the model: the floats the engine reads from the pack into dense.bin in the form it
     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
     todo, problems = [], []
+    n_dense = sum(1 for _, t, _, _ in model.where.values() if not is_expert(t.name) and t.name not in NOT_IN_PACK)
+    i_dense = 0
     for name, (g, t, mm, p) in model.where.items():
         if is_expert(t.name) or t.name in NOT_IN_PACK:
             continue
+        i_dense += 1
+        emit_progress("dense", i_dense, n_dense, t.name)
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
             return 1
@@ -441,6 +456,7 @@ def expert_layout(model: Model, src: pathlib.Path):
         return "the routers disagree on the expert count; a per-layer pruned model cannot be packed"
     layout, lines, offset, n_split = [], [], 0, 0
     for l in range(n_layers):
+        emit_progress("experts", l + 1, n_layers, "layer %d" % l)
         names = ["blk.%d.ffn_%s_exps.weight" % (l, r) for r in ROLES]
         if any(n not in T for n in names):
             return "layer %d: missing %s" % (l, ", ".join(n for n in names if n not in T))
@@ -563,6 +579,7 @@ def main() -> int:
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
+        emit_progress("tokenizer", 0, 0, "exporting the tokenizer")
         subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
@@ -576,9 +593,11 @@ def main() -> int:
     if a.skip_experts or not a.experts_bin:
         if path.exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
+        emit_progress("done", 1, 1, "pack ready")
         return 0
     if reuse:
         print("experts.bin was cut from this model's shards (%s); not rewritten" % sidecar.name)
+        emit_progress("done", 1, 1, "pack ready")
         return 0
     # written under a temporary name and renamed when complete, then the sidecar: an interrupted write leaves no
     # experts.bin, and an experts.bin without its sidecar is never reused
@@ -586,6 +605,7 @@ def main() -> int:
     part = out / "experts.bin.tmp"
     with open(part, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
+            emit_progress("experts_bin", l + 1, len(layout), "layer %d" % l)
             fo.write(layer_blobs(blob, ts).tobytes())
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
@@ -595,6 +615,7 @@ def main() -> int:
     side_tmp.write_text(json.dumps(want, indent=2) + "\n", encoding="utf-8")
     side_tmp.replace(sidecar)
     print("experts.bin: %d layers, %.2f GiB" % (len(layout), offset / 2**30))
+    emit_progress("done", 1, 1, "pack ready")
     return 0
 
 

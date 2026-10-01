@@ -292,12 +292,19 @@ def main():
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="resolve/main base URL of another BF16 checkpoint with the MTP head (a finetune "
+                                   "such as Swift-1.5 has its own), e.g. "
+                                   "https://huggingface.co/ukisai/Swift1.5-Qwen3.8-Flash-Next/resolve/main/; its "
+                                   "tensors are not checked against the pinned revision's hashes")
     a = ap.parse_args()
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:
             print("MTP tensor missing or corrupt: %s" % name, file=sys.stderr)
         sys.exit(BAD if bad else 0)
+    if a.repo:
+        global REPO
+        REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     resolve_repo()
     inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
 
