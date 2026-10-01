@@ -1,4 +1,4 @@
-# vllm-arcfork
+# arcfork-strata
 
 > **A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** (MIT), merged with upstream `v0.1.32`.
 > This fork is not affiliated with or endorsed by the Strata authors. Upstream's README is kept verbatim at the
@@ -6,7 +6,7 @@
 
 ## What this is
 
-`vllm-arcfork` is an internal fork of the **Strata** inference engine. Strata upstream is a specialised,
+`arcfork-strata` is an internal fork of the **Strata** inference engine. Strata upstream is a specialised,
 high-performance engine for *one* model family - **Qwen3.8-Flash-Next** - originally through ISTA-DASLab's
 **GSQ-RCO** i-quant packs, and since v0.1.31 also through ordinary GGUFs such as unsloth's `UD-Q4_K_XL`.
 
@@ -62,7 +62,7 @@ many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep
 ## Building and running
 
 ```bash
-git clone <this fork> && cd vllm-arcfork
+git clone <this fork> && cd arcfork-strata
 # a source build for the ordinary GGUFs: the K-quant (and Q5_0) MMQ prompt kernels are build options, off upstream
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
       -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_ORCA_Q4KS_MMQ=ON
