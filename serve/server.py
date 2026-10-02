@@ -309,7 +309,8 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
-        rc = self.proc.poll()
+        proc = self.proc                                 # a restart on another request's thread may clear it
+        rc = proc.poll() if proc is not None else None
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
@@ -319,13 +320,15 @@ class StrataEngine:
                 "smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
-        return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
+        proc = self.proc                                 # batch-2: read once, a restart may clear it meanwhile
+        return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
-        if self.proc is None:
+        proc = self.proc
+        if proc is None:
             return None
         try:
-            return self.proc.wait(timeout=5)
+            return proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             return None
 

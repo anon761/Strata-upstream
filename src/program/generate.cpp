@@ -4487,6 +4487,38 @@ int main(int argc, char** argv) {
                              (long long) win_batch, (double) acc_batch / (2.0 * (double) win_batch));
                 return differ == 0 ? 0 : 1;
             }
+            // STRATA_BATCH2_GRAPHS=1: every batch-window shape the serve scheduler can use (each sequence up to half
+            // the verifier's width, and the second sequence alone), captured once; prints what they took per device
+            if (std::getenv("STRATA_BATCH2_GRAPHS") != nullptr) {
+                const int cap = ver.max_window() / 2;
+                std::vector<size_t> free0(stages.size() + 1);
+                auto free_of = [&](size_t i) {
+                    const strata::core::OnDevice on(i == 0 ? 0 : stages[i - 1]->dev);
+                    size_t f = 0, t = 0;
+                    cudaDeviceSynchronize();
+                    cudaMemGetInfo(&f, &t);
+                    return f;
+                };
+                for (size_t i = 0; i < free0.size(); ++i) free0[i] = free_of(i);
+                zero_all();
+                std::vector<int32_t> tk((size_t) ver.max_window(), tok0[0]), out((size_t) ver.max_window());
+                int shapes = 0;
+                for (int ta = 0; ta <= cap; ++ta)
+                    for (int tb = 1; tb <= cap; ++tb) {
+                        const int64_t p[2] = {0, 0};
+                        const int keep[2] = {ta, tb};
+                        if (!ver.run_batch(ta + tb, ta, tk.data(), p, win_pool_fn, win_pool_user, out.data(), err) ||
+                            !ver.commit_batch(keep, err)) {
+                            std::fprintf(stderr, "strata batch2: shape %d + %d: %s\n", ta, tb, err.c_str());
+                            return 1;
+                        }
+                        ++shapes;
+                    }
+                for (size_t i = 0; i < free0.size(); ++i)
+                    std::fprintf(stderr, "strata batch2 graphs: %d shapes, device part %zu: %.0f MiB\n", shapes, i,
+                                 (double) (free0[i] - free_of(i)) / 1048576.0);
+                return 0;
+            }
             const int64_t V = ver.vocab();
             std::vector<int32_t> pick[2];
             std::vector<float> logit[2];

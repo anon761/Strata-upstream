@@ -946,6 +946,8 @@ bool Verifier::capture(int T, std::string& err) { return capture_window(T, -1, &
 
 bool Verifier::capture_window(int T, int ta, cudaGraphExec_t* slot, std::string& err) {
     if (*slot != nullptr) return true;
+    size_t free0 = 0, total = 0;   // what the instantiated graph takes on this device (reported below)
+    cudaMemGetInfo(&free0, &total);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
@@ -1004,11 +1006,14 @@ bool Verifier::capture_window(int T, int ta, cudaGraphExec_t* slot, std::string&
     }
     const cudaError_t ue = cudaGraphUpload(*slot, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
+    size_t free1 = 0;
+    cudaMemGetInfo(&free1, &total);
+    const double mib = free0 > free1 ? (double) (free0 - free1) / 1048576.0 : 0.0;
     if (ta >= 0)
-        std::fprintf(stderr, "strata verify: captured the %d-token batch window, %d + %d (upload %s, sync %s)\n", T, ta,
-                     T - ta, cudaGetErrorString(ue), cudaGetErrorString(us));
+        std::fprintf(stderr, "strata verify: captured the %d-token batch window, %d + %d, %.1f MiB (upload %s, sync %s)\n",
+                     T, ta, T - ta, mib, cudaGetErrorString(ue), cudaGetErrorString(us));
     else
-        std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
+        std::fprintf(stderr, "strata verify: captured the %d-token window, %.1f MiB (upload %s, sync %s)\n", T, mib,
                      cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }
