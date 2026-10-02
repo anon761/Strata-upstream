@@ -4178,7 +4178,10 @@ int main(int argc, char** argv) {
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
-        if (const strata::core::OnDevice on_h(hist_dev); cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess) {
+        int32_t* d_hist2 = nullptr;   // batch-2: the second sequence's rows
+        if (const strata::core::OnDevice on_h(hist_dev);
+            cudaMalloc(&d_hist, kHistSlots * sizeof(int32_t)) != cudaSuccess ||
+            (o.batch2_cells > 0 && cudaMalloc(&d_hist2, kHistSlots * sizeof(int32_t)) != cudaSuccess)) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
@@ -4593,12 +4596,17 @@ int main(int argc, char** argv) {
         auto part_draft = [&](size_t s) -> const strata::core::QsaState* {
             return s + 1 == n_parts ? &mtp.kv_state() : nullptr;
         };
+        // batch-2's slot Y: the same parts over the second sessions and the twin drafter
+        auto part_ss2 = [&](size_t s) -> strata::core::SessionState& { return s == 0 ? ss2 : stages[s - 1]->ss2; };
+        auto part_draft2 = [&](size_t s) -> const strata::core::QsaState* {
+            return s + 1 == n_parts ? &twin.kv_state() : nullptr;
+        };
         // the checkpoint chain as stage s holds it: its running state under the chain's token ids; false when a
         // checkpoint lacks a stage's part
-        auto stage_checks = [&](size_t s, std::vector<ConvCheckpoint>& out) -> bool {
+        auto stage_checks = [&](const std::vector<ConvCheckpoint>& chain, size_t s, std::vector<ConvCheckpoint>& out) -> bool {
             out.clear();
-            out.reserve(checks.size());
-            for (const ConvCheckpoint& c : checks) {
+            out.reserve(chain.size());
+            for (const ConvCheckpoint& c : chain) {
                 if (c.stage_parts.size() != stages.size()) return false;
                 ConvCheckpoint part = s == 0 ? c : c.stage_parts[s - 1];
                 if (s == 0) part.stage_parts.clear();
@@ -4608,15 +4616,19 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        auto park_split = [&](size_t held) -> bool {
+        // parks a conversation as one image per part (a layer split's stages; one part on one GPU): `ids`/`imgs` what
+        // the slot holds, `chain` its checkpoints, from slot X or (batch-2) slot Y.  A full capture, no retained K/V.
+        auto park_parts = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                              const std::vector<ConvCheckpoint>& chain, bool cvec, bool slot_y, size_t held) -> bool {
+            auto pss = [&](size_t s) -> strata::core::SessionState& { return slot_y ? part_ss2(s) : part_ss(s); };
+            auto pdr = [&](size_t s) { return slot_y ? part_draft2(s) : part_draft(s); };
             std::vector<std::vector<ConvCheckpoint>> views(n_parts);
             size_t estimate = 0;
             for (size_t s = 0; s < n_parts; ++s) {
                 size_t part = 0;
                 const strata::core::OnDevice on(part_dev(s));
-                if (!stage_checks(s, views[s]) ||
-                    !strata::core::conversation_snapshot_bytes({live, live_imgs, views[s], cvec_cached}, part_ss(s), g,
-                                                               part_draft(s), part, err)) {
+                if (!stage_checks(chain, s, views[s]) ||
+                    !strata::core::conversation_snapshot_bytes({ids, imgs, views[s], cvec}, pss(s), g, pdr(s), part, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage %zu: %s)\n", s,
                                  err.empty() ? "a checkpoint without this stage's part" : err.c_str());
                     err.clear();
@@ -4624,7 +4636,7 @@ int main(int argc, char** argv) {
                 }
                 estimate += part;
             }
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(ids, imgs, chain, cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             if (!conversations.make_room(estimate, held)) {
@@ -4646,8 +4658,8 @@ int main(int argc, char** argv) {
                 for (size_t s = 0; s < n_parts; ++s) {
                     const strata::core::OnDevice on(part_dev(s));
                     strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, {live, live_imgs, views[s], cvec_cached},
-                                                                  part_ss(s), g, part_draft(s), err)) return false;
+                    if (!strata::core::conversation_snapshot_save(part, {ids, imgs, views[s], cvec}, pss(s), g, pdr(s),
+                                                                  err)) return false;
                     if (s == 0) image = std::move(part);
                     else image.stage_parts.push_back(std::move(part));
                 }
@@ -4660,12 +4672,15 @@ int main(int argc, char** argv) {
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens (%zu stages) in %.1f ms; parked=%zu "
                                      "bytes=%zu evictions=%zu snapshot_bytes=%zu\n", stored ? "parked" : "skipped",
-                             live.size(), n_parts, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             ids.size(), n_parts, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes);
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
             return true;
+        };
+        auto park_split = [&](size_t held) -> bool {
+            return park_parts(live, live_imgs, checks, cvec_cached, false, held);
         };
         // a split image's parts, each checked against its stage before anything is restored
         auto split_valid = [&](const strata::core::SavedConversation& image) -> bool {
@@ -4764,6 +4779,9 @@ int main(int argc, char** argv) {
             return true;
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        // batch-2 protocol: a request sent as `GEN ... id=N` gets its lines as T@N, PP@N, REUSED@N, DONE@N, ERR@N
+        std::string req_tag;
+        long long req_id = -1;
         Clock::time_point pp_t0 = Clock::now();
         auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
             std::vector<ImgKey> v;
@@ -4828,7 +4846,7 @@ int main(int argc, char** argv) {
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
+            std::printf("PP%s %lld %lld %.0f %.1f\n", req_tag.c_str(), (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
@@ -4969,6 +4987,17 @@ int main(int argc, char** argv) {
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
         std::atomic<bool> stop_req{false};
+        std::mutex stop_mu;               // `STOP <id>`: the tagged requests to stop (batch-2)
+        std::set<long long> stop_ids;
+        auto stopped = [&](long long id) {
+            if (id < 0) return false;
+            std::lock_guard<std::mutex> lk(stop_mu);
+            return stop_ids.count(id) > 0;
+        };
+        auto forget_stop = [&](long long id) {
+            std::lock_guard<std::mutex> lk(stop_mu);
+            stop_ids.erase(id);
+        };
         std::mutex in_mu;
         std::condition_variable in_cv;
         std::deque<std::string> in_lines;
@@ -5005,6 +5034,11 @@ int main(int argc, char** argv) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
+                if (l.rfind("STOP ", 0) == 0) {
+                    std::lock_guard<std::mutex> lk(stop_mu);
+                    stop_ids.insert(std::atoll(l.c_str() + 5));
+                    continue;
+                }
                 std::lock_guard<std::mutex> lk(in_mu);
                 in_lines.push_back(l);
                 in_cv.notify_one();
@@ -5021,7 +5055,7 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
-        sp.should_stop = [&] { return stop_req.load(); };
+        sp.should_stop = [&] { return stop_req.load() || stopped(req_id); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -5110,13 +5144,15 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        // "stop": this engine honours STOP; "batch2": it decodes two tagged requests together (STOP <id> stops one)
+        std::printf("READY %lld stop%s\n", (long long) o.max_context, o.batch2_cells > 0 ? " batch2" : "");
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, S) : S;   // the MTP's windows; suffixes go up to S
         if (S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
+        if (S_mtp < S && o.batch2_cells > 0) twin.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -5127,7 +5163,180 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
-        while (next_line(line)) {
+        // ---- batch-2 (docs/BATCH2.md): the GUEST is a request that left slot X for slot Y when another tagged one
+        // arrived; it decodes there until it ends - in lock-step with X's request, or alone while X has none.
+        // Slot X reads every prompt, as before.
+        struct Guest {
+            bool active = false;
+            long long id = -1, max_new = 0;
+            std::string tag;
+            strata::kernels::SamplerParams sp;
+            double spec_min_p = 0.0;
+            int hist_n = 0;
+            bool cvec = true;
+            std::vector<int32_t> consumed;          // what slot Y holds
+            std::vector<ConvCheckpoint> checks;     // its prompt's checkpoints (host copies), parked with it
+            int64_t n = 0, resume = 0, p = 0, produced_n = 0, draft_offered = 0, draft_accepted = 0;
+            int32_t x = 0;
+            double prompt_ms = 0.0;
+            std::vector<int32_t> drafts;
+            std::vector<float> dprob;
+            Clock::time_point d0;
+            int64_t hits0 = 0, look0 = 0, ram0 = 0, files0 = 0;
+            uint64_t file_bytes0 = 0;
+            // this window's share, between guest_rows and guest_after
+            int T = 0, a = 0, emit = 0;
+        } guest;
+        const size_t kWin = (size_t) std::max(S, ver.max_window());
+        std::vector<int32_t> gstage(kHistSlots, -1);
+        // the guest's next window width: as the serve loop picks its own (MTP only)
+        auto guest_width = [&](int cap) {
+            int T = std::min(S_mtp, cap);
+            if (guest.spec_min_p > 0.0) {
+                T = 1;
+                while (T < std::min(S_mtp, cap) && guest.dprob[(size_t) T - 1] >= (float) guest.spec_min_p) ++T;
+            }
+            return T;
+        };
+        // the guest's rows of the next window into `rows` (its fed-back token, then its drafts), and their penalty
+        // histories into the second history buffer
+        auto guest_rows = [&](int32_t* rows, int cap) {
+            guest.T = guest_width(cap);
+            rows[0] = guest.x;
+            for (int i = 1; i < guest.T; ++i) rows[i] = guest.drafts[(size_t) i - 1];
+            if (guest.hist_n > 0) {
+                strata::kernels::penalty_rows(guest.consumed.data(), (int64_t) guest.consumed.size(), rows, guest.T,
+                                              guest.hist_n, gstage.data());
+                const strata::core::OnDevice on_h(hist_dev);
+                cudaMemcpy(d_hist2, gstage.data(), (size_t) guest.T * (size_t) guest.hist_n * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+            }
+            ver.set_batch_sampling(guest.sp, guest.hist_n > 0 ? d_hist2 : nullptr, guest.hist_n);
+        };
+        // after the window ran: how many of its rows the guest keeps (`out` = its rows' picks)
+        auto guest_accept = [&](const int32_t* rows, const int32_t* out) {
+            guest.a = 0;
+            while (guest.a < guest.T - 1 && rows[guest.a + 1] == out[guest.a]) ++guest.a;
+            guest.emit = 0;
+            for (bool end = false; guest.emit <= guest.a && guest.produced_n + guest.emit < guest.max_new && !end; ++guest.emit)
+                end = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out[guest.emit]) != o.eos_ids.end();
+        };
+        // the guest leaves slot Y: DONE, and its conversation parked like any finished request's
+        auto guest_end = [&](const char* finish) -> bool {
+            const int64_t hits = drive.d.cache_hits - guest.hits0;
+            const int64_t look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - guest.look0;
+            const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - guest.d0).count();
+            std::printf("DONE%s %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f\n", guest.tag.c_str(),
+                        (long long) guest.produced_n, (long long) guest.n, guest.prompt_ms, decode_ms, finish,
+                        (long long) guest.draft_accepted, (long long) guest.draft_offered, (long long) guest.resume,
+                        (long long) hits, (long long) look, (long long) (src.ram_reads() - guest.ram0),
+                        (long long) (src.file_reads() - guest.files0),
+                        (double) (src.file_read_bytes() - guest.file_bytes0) / 1e6);
+            std::fflush(stdout);
+            forget_stop(guest.id);
+            guest.active = false;
+            if (o.prompt_cache > 0 && conversations.enabled() && !guest.consumed.empty()) {
+                for (size_t s = 0; s < n_parts; ++s) {   // the snapshot reads a synchronized device
+                    const strata::core::OnDevice on(part_dev(s));
+                    cudaDeviceSynchronize();
+                }
+                if (!park_parts(guest.consumed, {}, guest.checks, guest.cvec, true, 0)) return false;
+            }
+            guest.checks.clear();
+            return true;
+        };
+        // after the window's commit: the guest's outputs, the end of the guest or its next drafts
+        auto guest_after = [&](const int32_t* rows, const int32_t* out, int row0) -> bool {
+            for (int i = 0; i < guest.emit; ++i) guest.consumed.push_back(rows[i]);
+            guest.draft_offered += guest.T - 1;
+            guest.draft_accepted += guest.a;
+            bool eos = false;
+            for (int i = 0; i <= guest.a && guest.produced_n < guest.max_new && !eos; ++i) {
+                std::printf("T%s %d\n", guest.tag.c_str(), (int) out[i]);
+                ++guest.produced_n;
+                eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) out[i]) != o.eos_ids.end();
+            }
+            std::fflush(stdout);
+            strata::core::progress_beat();
+            if (eos) return guest_end("stop");
+            if (guest.produced_n >= guest.max_new) return guest_end("length");
+            if (stopped(guest.id)) return guest_end("cancel");
+            if (guest.p + guest.a + 1 + S_mtp > o.batch2_cells) return guest_end("length");   // slot Y is full
+            const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+            if (!twin.stage_rows(ver.final_R_all() + (size_t) row0 * hcn, guest.T, err) ||
+                !twin.draft(guest.T, out, guest.p, guest.a, guest.drafts.data(), err, guest.dprob.data(),
+                            (float) guest.spec_min_p))
+                return false;
+            guest.x = out[guest.a];
+            guest.p += guest.a + 1;
+            return true;
+        };
+        // one window of the guest alone (slot X has no request)
+        std::vector<int32_t> gwin(kWin), gout(kWin);
+        auto guest_step = [&]() -> bool {
+            guest_rows(gwin.data(), ver.max_window());
+            const int64_t pos[2] = {0, guest.p};
+            if (!ver.run_batch(guest.T, 0, gwin.data(), pos, win_pool_fn, win_pool_user, gout.data(), err) ||
+                drive.d.failed) {
+                if (drive.d.failed && drive.d.fail) err = drive.d.fail;
+                return false;
+            }
+            guest_accept(gwin.data(), gout.data());
+            const int keep[2] = {0, guest.emit};
+            return ver.commit_batch(keep, err) && guest_after(gwin.data(), gout.data(), 0);
+        };
+        // moves X's request (the cells `ids`, and the drafter's) to slot Y: a snapshot of every part, validated
+        // against slot Y before anything there is written
+        auto move_to_y = [&](const std::vector<int32_t>& ids) -> bool {
+            const std::vector<ImgKey> no_imgs;
+            const std::vector<ConvCheckpoint> no_chain;
+            std::vector<strata::core::SavedConversation> parts(n_parts);
+            for (size_t s = 0; s < n_parts; ++s) {
+                const strata::core::OnDevice on(part_dev(s));
+                cudaDeviceSynchronize();
+                if (!strata::core::conversation_snapshot_save(parts[s], {ids, no_imgs, no_chain, cvec_cached}, part_ss(s),
+                                                              g, part_draft(s), err) ||
+                    !strata::core::conversation_snapshot_validate(parts[s], part_ss2(s), g, part_draft2(s), err))
+                    return false;
+            }
+            for (size_t s = 0; s < n_parts; ++s) {
+                const strata::core::OnDevice on(part_dev(s));
+                if (strata::core::conversation_snapshot_restore(parts[s], part_ss2(s), g, part_draft2(s), err) !=
+                    strata::core::ConversationRestore::restored)
+                    return false;
+                cudaDeviceSynchronize();
+            }
+            return true;
+        };
+        // a tagged GEN is waiting (a request that may join a running one)
+        auto tagged_gen_waiting = [&]() {
+            std::lock_guard<std::mutex> lk(in_mu);
+            return !in_lines.empty() && in_lines.front().rfind("GEN ", 0) == 0 &&
+                   in_lines.front().find(" id=") != std::string::npos;
+        };
+        // the next request line; while the guest decodes alone, its windows run until one arrives
+        bool guest_fatal = false;
+        auto next_request = [&](std::string& out) -> bool {
+            while (guest.active) {
+                {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    if (!in_lines.empty() || in_eof) break;
+                }
+                strata::core::progress().busy.store(true);
+                strata::core::progress_at("batch-2 guest window");
+                const bool ok = guest_step();
+                strata::core::progress().busy.store(false);
+                strata::core::progress_at("idle");
+                if (!ok) {
+                    std::printf("ERR%s %s\n", guest.tag.c_str(), err.c_str());
+                    std::fflush(stdout);
+                    guest_fatal = true;
+                    return false;
+                }
+            }
+            return next_line(out);
+        };
+        while (next_request(line)) {
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
             struct BusyScope {
@@ -5136,9 +5345,11 @@ int main(int argc, char** argv) {
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
+            req_id = -1;
+            req_tag.clear();
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (!geni && line.rfind("GEN ", 0) != 0) {
-                std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
+                std::printf("ERR%s expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n", req_tag.c_str());
                 continue;
             }
             char* endp = nullptr;
@@ -5168,6 +5379,10 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "id") {   // batch-2: the request's tag (its output lines carry @id)
+                        req_id = std::atoll(tok.c_str() + eq + 1);
+                        req_tag = "@" + std::to_string(req_id);
+                    }
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -5191,12 +5406,16 @@ int main(int argc, char** argv) {
             std::vector<int64_t> ids;
             std::string pe;
             if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
-                std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
+                std::printf("ERR%s bad request: %s\n", req_tag.c_str(), pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (guest.active && req_id >= 0 && req_id == guest.id) {
+                std::printf("ERR%s a request with this id is still running\n", req_tag.c_str());
+                continue;
+            }
             req_imgs.clear();
-            if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            if (geni && !o.vision) { std::printf("ERR%s this engine was started without --vision\n", req_tag.c_str()); continue; }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
@@ -5280,7 +5499,7 @@ int main(int argc, char** argv) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                     upload_mrope();
                     mrope_identity = true;
-                    std::printf("ERR %s\n", ve.c_str());
+                    std::printf("ERR%s %s\n", req_tag.c_str(), ve.c_str());
                     std::fflush(stdout);
                     continue;
                 }
@@ -5288,13 +5507,13 @@ int main(int argc, char** argv) {
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
             if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                std::printf("ERR%s prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", req_tag.c_str(), (long long) n,
                             (long long) max_new, (long long) o.max_context);
                 continue;
             }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
-            if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
+            if (bad) { std::printf("ERR%s a token id is outside the vocabulary\n", req_tag.c_str()); continue; }
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
@@ -5326,7 +5545,7 @@ int main(int argc, char** argv) {
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
             if (!ver.wait_commit(err)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                 return 1;
             }
             int64_t resume = 0;
@@ -5354,7 +5573,7 @@ int main(int argc, char** argv) {
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             if ((!from_live || incoming) && !park_current(incoming ? incoming->bytes() : 0)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                 return 1;
             }
             if (incoming && !stages.empty()) {
@@ -5363,7 +5582,7 @@ int main(int argc, char** argv) {
                 if (!split_restore(*incoming, chain)) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                    std::printf("ERR%s restoring parked conversation: %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
                 live = std::move(incoming->live.ids);
@@ -5384,14 +5603,14 @@ int main(int argc, char** argv) {
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                    std::printf("ERR%s restoring parked conversation: %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
                 if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
                     if (!strata::core::conversation_kv_verify(incoming->kv.back(), mtp.kv_state(), g,
                             int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
-                        std::printf("ERR verifying restored draft KV: %s\n", err.c_str());
+                        std::printf("ERR%s verifying restored draft KV: %s\n", req_tag.c_str(), err.c_str());
                         return 1;
                     }
                     std::fprintf(stderr, "strata serve: SNAPSHOT_VERIFY draft=%016llx cells=%lld mode=%d source=%s resident=%lld\n",
@@ -5464,7 +5683,7 @@ int main(int argc, char** argv) {
                                }
                                return false;
                            }()) {
-                    std::printf("ERR restoring a conversation checkpoint failed\n");
+                    std::printf("ERR%s restoring a conversation checkpoint failed\n", req_tag.c_str());
                     return 1;
                 }
             }
@@ -5546,7 +5765,7 @@ int main(int argc, char** argv) {
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                std::printf("PP%s %lld %lld %.0f %.1f\n", req_tag.c_str(), (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
                 strata::core::progress_beat();
                 std::fflush(stdout);
@@ -5715,11 +5934,11 @@ int main(int argc, char** argv) {
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
-                    std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                    std::printf("ERR%s refilling a lent slot failed: %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
                 if (!win && !lend(to - at, err)) {
-                    std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                    std::printf("ERR%s lending the prompt path its slots failed: %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
                 const auto tsp = Clock::now();
@@ -5733,7 +5952,7 @@ int main(int argc, char** argv) {
                 if (!sp_ok) {
                     if (!stop_req.load()) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                        std::printf("ERR %s\n", err.c_str());
+                        std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
                         // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
                         if (cudaPeekAtLastError() != cudaSuccess) {
@@ -5748,22 +5967,22 @@ int main(int argc, char** argv) {
                 }
                 at = to;
                 if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
-                    std::printf("ERR saving a conversation checkpoint failed\n");
+                    std::printf("ERR%s saving a conversation checkpoint failed\n", req_tag.c_str());
                     return 1;
                 }
             }
             if (!refill(err)) {
-                std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                std::printf("ERR%s refilling a lent slot failed: %s\n", req_tag.c_str(), err.c_str());
                 return 1;
             }
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-            std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
+            std::printf("REUSED%s %lld\n", req_tag.c_str(), (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
             int64_t p = n - 1;
             int32_t x = (int32_t) ids[(size_t) (n - 1)];
-            std::vector<int32_t> drafts((size_t) S, 0), window((size_t) S), outv((size_t) S);
+            std::vector<int32_t> drafts((size_t) S, 0), window(kWin), outv(kWin);
             std::vector<float> dprob((size_t) S, 0.0f);
             std::vector<int32_t> sbuf((size_t) S, 0);
             if (o.suffix_draft > 0) {
@@ -5799,18 +6018,22 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
+            bool suspended = false;   // batch-2: this request moved to slot Y and goes on as the guest
             while (!cancelled && produced_n < max_new) {
-                int T = S_mtp;
+                // batch-2: with a guest in slot Y this window carries its rows too; each gets half of the width
+                const bool with_guest = guest.active;
+                const int cap = with_guest ? ver.max_window() / 2 : S_mtp;
+                int T = std::min(S_mtp, cap);
                 if (req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    while (T < std::min(S_mtp, cap) && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
+                if (o.suffix_draft > 0 && !first_window && !with_guest) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
                     if (k > 0 && sbuf[0] == drafts[0]) {
@@ -5823,6 +6046,7 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
+                if (with_guest) guest_rows(window.data() + T, cap);
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -5840,12 +6064,17 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                const int64_t pos2[2] = {p, guest.p};
+                if (!(with_guest ? ver.run_batch(T + guest.T, T, window.data(), pos2, win_pool_fn, win_pool_user,
+                                                 outv.data(), err)
+                                 : ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err)) ||
+                    drive.d.failed) {
+                    std::printf("ERR%s %s\n", req_tag.c_str(), drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (with_guest) guest_accept(window.data() + T, outv.data() + T);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -5858,9 +6087,10 @@ int main(int argc, char** argv) {
                 int emit = 0;
                 for (bool end = false; emit <= a && produced_n + emit < max_new && !end; ++emit)
                     end = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) emit]) != o.eos_ids.end();
-                if (!ver.commit(emit, err)) {
+                const int keep2[2] = {emit, guest.emit};
+                if (!(with_guest ? ver.commit_batch(keep2, err) : ver.commit(emit, err))) {
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
                 // the window's first `emit` tokens are in the session now (the last output is not: it is next x)
@@ -5870,13 +6100,18 @@ int main(int argc, char** argv) {
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
-                    std::printf("T %d\n", (int) outv[(size_t) i]);
+                    std::printf("T%s %d\n", req_tag.c_str(), (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
+                if (with_guest && !guest_after(window.data() + T, outv.data() + T, T)) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR%s %s\n", guest.tag.c_str(), err.c_str());
+                    return 1;
+                }
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
@@ -5893,25 +6128,67 @@ int main(int argc, char** argv) {
                 }
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR%s an adaptive refill failed\n", req_tag.c_str());
                     return 1;
                 }
                 if (!drafted) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                     return 1;
                 }
-                if (timed_round && !eos)
+                if (timed_round && !eos && !with_guest)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (stop_req.load() || stopped(req_id)) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                // batch-2: a tagged request waits and slot Y is free -> this request moves there and goes on as the
+                // guest, and the request loop reads the new one into slot X
+                if (o.batch2_cells > 0 && !guest.active && req_id >= 0 && !geni && (int64_t) consumed.size() == p &&
+                    p + (max_new - produced_n) + S + 8 <= o.batch2_cells && tagged_gen_waiting()) {
+                    const auto tm = Clock::now();
+                    if (!ver.wait_commit(err) || !move_to_y(consumed)) {
+                        std::printf("ERR%s moving to the second slot: %s\n", req_tag.c_str(), err.c_str());
+                        return 1;
+                    }
+                    guest.active = true;
+                    guest.id = req_id;
+                    guest.tag = req_tag;
+                    guest.max_new = max_new;
+                    guest.sp = req_sp;
+                    guest.spec_min_p = req_spec_min_p;
+                    guest.hist_n = hist_n;
+                    guest.cvec = cvec_cached;
+                    guest.consumed = consumed;
+                    guest.checks = checks;
+                    guest.n = n;
+                    guest.resume = resume;
+                    guest.p = p;
+                    guest.x = x;
+                    guest.produced_n = produced_n;
+                    guest.draft_offered = draft_offered;
+                    guest.draft_accepted = draft_accepted;
+                    guest.prompt_ms = prompt_ms;
+                    guest.drafts = drafts;
+                    guest.dprob = dprob;
+                    guest.d0 = d0;
+                    guest.hits0 = decode_hits0;
+                    guest.look0 = decode_look0;
+                    guest.ram0 = ram0;
+                    guest.files0 = files0;
+                    guest.file_bytes0 = file_bytes0;
+                    std::fprintf(stderr, "strata serve: batch-2: request %lld moved to the second slot at %lld tokens in "
+                                         "%.1f ms\n", req_id, (long long) p,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tm).count());
+                    suspended = true;
+                    break;
+                }
             }
+            if (suspended) continue;   // no DONE: it goes on in slot Y
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR%s %s\n", req_tag.c_str(), err.c_str());
                 return 1;
             }
             if (dec_timing && dec_windows > 0) {
@@ -5941,7 +6218,7 @@ int main(int argc, char** argv) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
                 if (cudaDeviceSynchronize() != cudaSuccess) {
-                    std::printf("ERR synchronizing state fingerprint\n");
+                    std::printf("ERR%s synchronizing state fingerprint\n", req_tag.c_str());
                     return 1;
                 }
                 const int64_t L = (int64_t) live.size();
@@ -6036,7 +6313,7 @@ int main(int argc, char** argv) {
                 for (const auto& [pool, w] : kv_arrays(ms))
                     if (pool != nullptr) h_mtp = hash_cells(pool, w, 0, mL, h_mtp);
                 if (!hash_ok) {
-                    std::printf("ERR reading state fingerprint\n");
+                    std::printf("ERR%s reading state fingerprint\n", req_tag.c_str());
                     return 1;
                 }
                 std::fprintf(stderr, "strata serve: STATE_HASH L=%lld gdn=%016llx ple=%016llx tail=%016llx pooled=%016llx "
@@ -6050,7 +6327,8 @@ int main(int argc, char** argv) {
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
             //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f\n", (long long) produced_n,
+            forget_stop(req_id);
+            std::printf("DONE%s %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f\n", req_tag.c_str(), (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
@@ -6123,7 +6401,7 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_begin() - begin_before[(size_t) r],
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
-        return 0;
+        return guest_fatal ? 1 : 0;
     }
 
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
