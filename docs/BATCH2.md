@@ -41,6 +41,26 @@ same arrays, so a second commit graph with a token offset, its own session, its 
   cache keeps its share.
 - **Drafts**: each sequence keeps its own MTP drafter state; the window width is split between the two.
 
+## Status
+
+**M1 done** (2026-10-02, prod 2x RTX 3090, Qwen3.8-Flash-Next-Uncensored-Q5_K_M, layer split over both GPUs, int8 K/V).
+`STRATA_BATCH2_SELFTEST=<steps>` with `STRATA_BATCH2_SPLIT=na,nb` decodes two sequences alone (one-token windows)
+and then teacher-forced in batch windows of na + nb tokens: the picks agree and every logit row is bitwise equal.
+Passed for 1+1, 2+2, 3+2 and 1+4 over 300 steps.
+
+First throughput numbers from the same self-test (wall time of window + commit, expert cache warm):
+
+| windows | alone (one-token windows) | batched, both sequences |
+|---|---|---|
+| 1+1 | 46-51 tok/s | 58.5 tok/s |
+| 2+2 (teacher-forced: every token kept) | 51.5 tok/s | 93.0 tok/s |
+| 3+2 | 51.4 tok/s | 101.5 tok/s |
+
+The 1+1 row is the clean batch gain (~1.15-1.25x). The wider rows are what a window of T tokens costs in general -
+a single sequence's MTP window of the same width costs about as much, so with drafts the gain comes from two
+sequences filling the window with tokens that are each kept more often than a fourth or fifth draft would be.
+M4 has to measure that against the serial engine with MTP.
+
 ## Milestones
 
 1. **M1 engine**: second `SessionState` per stage; `record_window` with per-group sessions and a free split `TA`;
