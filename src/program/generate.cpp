@@ -4284,31 +4284,56 @@ int main(int argc, char** argv) {
                     tok = out;
                 }
             }
+            // the batch run is teacher-forced on the sequences' own picks: STRATA_BATCH2_SPLIT=na,nb (default 1,1)
+            // puts na tokens of the first and nb of the second in each window, so the rows of a window line up
+            // with steps of the runs alone (the uneven splits are what MTP drafts produce)
+            int na = 1, nb = 1;
+            if (const char* sp = std::getenv("STRATA_BATCH2_SPLIT"); sp != nullptr && std::sscanf(sp, "%d,%d", &na, &nb) != 2) {
+                std::fprintf(stderr, "strata batch2: STRATA_BATCH2_SPLIT wants na,nb\n");
+                return 1;
+            }
+            if (na < 1 || nb < 1 || na + nb > ver.max_window()) {
+                std::fprintf(stderr, "strata batch2: split %d,%d does not fit the window (%d)\n", na, nb, ver.max_window());
+                return 1;
+            }
+            std::vector<int32_t> input[2];   // step i's input: the start token, then the pick of step i - 1
+            for (int q = 0; q < 2; ++q) {
+                input[q].push_back(tok0[q]);
+                input[q].insert(input[q].end(), pick[q].begin(), pick[q].end() - 1);
+            }
             zero_all();
-            int32_t toks[2] = {tok0[0], tok0[1]};
-            int bad_picks = 0, bad_logits = 0;
+            int bad_picks = 0, bad_logits = 0, windows = 0;
             std::vector<float> row((size_t) V);
-            for (int i = 0; i < steps; ++i) {
-                const int64_t p[2] = {i, i};
-                const int keep[2] = {1, 1};
-                int32_t out[2] = {-1, -1};
-                if (!ver.run_batch(2, 1, toks, p, win_pool_fn, win_pool_user, out, err) || !ver.commit_batch(keep, err)) {
-                    std::fprintf(stderr, "strata batch2: batch step %d: %s\n", i, err.c_str());
+            int done[2] = {0, 0};   // each sequence advances by its own share until one has no full share left
+            while (done[0] + na <= steps && done[1] + nb <= steps) {
+                int32_t tk[strata::kernels::kVerifyMaxT];
+                int32_t out[strata::kernels::kVerifyMaxT];
+                for (int t = 0; t < na; ++t) tk[t] = input[0][(size_t) (done[0] + t)];
+                for (int t = 0; t < nb; ++t) tk[na + t] = input[1][(size_t) (done[1] + t)];
+                const int64_t p[2] = {done[0], done[1]};
+                const int keep[2] = {na, nb};
+                if (!ver.run_batch(na + nb, na, tk, p, win_pool_fn, win_pool_user, out, err) ||
+                    !ver.commit_batch(keep, err)) {
+                    std::fprintf(stderr, "strata batch2: batch window %d: %s\n", windows, err.c_str());
                     return 1;
                 }
-                for (int q = 0; q < 2; ++q) {
-                    bad_picks += out[q] != pick[q][(size_t) i];
-                    if (!ver.copy_logits(q, row.data())) {
+                ++windows;
+                for (int t = 0; t < na + nb; ++t) {
+                    const int q = t < na ? 0 : 1;
+                    const int step = done[q] + (q == 0 ? t : t - na);
+                    bad_picks += out[t] != pick[q][(size_t) step];
+                    if (!ver.copy_logits(t, row.data())) {
                         std::fprintf(stderr, "strata batch2: the batch logits could not be read\n");
                         return 1;
                     }
-                    bad_logits += std::memcmp(row.data(), logit[q].data() + (size_t) i * V, (size_t) V * 4) != 0;
-                    toks[q] = out[q];
+                    bad_logits += std::memcmp(row.data(), logit[q].data() + (size_t) step * V, (size_t) V * 4) != 0;
                 }
+                done[0] += na;
+                done[1] += nb;
             }
-            std::fprintf(stderr, "strata batch2: %d steps x 2 sequences: %d picks and %d logit rows differ from the "
-                                 "sequences alone - %s\n", steps, bad_picks, bad_logits,
-                         bad_picks == 0 && bad_logits == 0 ? "PASS" : "FAIL");
+            std::fprintf(stderr, "strata batch2: %d steps x 2 sequences in %d windows of %d+%d: %d picks and %d logit "
+                                 "rows differ from the sequences alone - %s\n", steps, windows, na, nb, bad_picks,
+                         bad_logits, bad_picks == 0 && bad_logits == 0 ? "PASS" : "FAIL");
             return bad_picks == 0 && bad_logits == 0 ? 0 : 1;
         }
         std::vector<int64_t> cur;
