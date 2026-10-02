@@ -61,6 +61,22 @@ a single sequence's MTP window of the same width costs about as much, so with dr
 sequences filling the window with tokens that are each kept more often than a fourth or fifth draft would be.
 M4 has to measure that against the serial engine with MTP.
 
+**M2 test done** (same day): `STRATA_BATCH2_DECODE=<tokens>` decodes the two sequences with MTP drafts, greedily,
+first each alone (fixed windows of `--mtp-max-t` tokens), then in lock-step in batch windows of twice that, the second
+sequence drafting with a twin drafter (`MtpDrafter::load_twin`: shared weights and draft head, its own K/V ring,
+buffers and stream; ~19 MiB at 4096 cells).  400 tokens x 2, identical outputs for every width:
+
+| tokens per sequence and window | alone | lock-step, both | gain | ms per window alone / batched |
+|---|---|---|---|---|
+| 4 | 49.0 tok/s | 56.9 tok/s | 1.16x | 46 / 80 |
+| 3 | 54.6 tok/s | 61.1 tok/s | 1.12x | 37 / 66 |
+| 2 | 77.0 tok/s | 92.1 tok/s | 1.20x | 23 / 39 |
+
+What it says: a window's cost grows almost linearly with its rows (~10-11 ms per row on this box) - the misses of
+each row's routed experts, computed on the CPU, dominate, and two different conversations share few of them.  The
+part a batch shares (dense weights, the fixed cost per window) is small here, so batch-2 tops out at ~1.2x.  (The
+alone column uses fixed windows; prod adapts the width with `--spec-min-p`.)
+
 ## Milestones
 
 1. **M1 engine**: second `SessionState` per stage; `record_window` with per-group sessions and a free split `TA`;
