@@ -85,3 +85,27 @@ alone column uses fixed windows; prod adapts the width with `--spec-min-p`.)
 2. **M2 decode loop**: two requests decode in lock-step, drafts per sequence; greedy parity with the serial run.
 3. **M3 server**: `serve/server.py` admits a second request into the running batch (prompt reading stays serial).
 4. **M4 measurement** on the 2x RTX 3090: aggregate tok/s with two agents vs serial, hit rates, VRAM.
+
+## M3 plan (serve)
+
+Two slots: **X** (today's session chain and drafter; the only one that reads prompts, with the whole prompt path -
+conversation-cache resume, checkpoints, images) and **Y** (`--batch2-cells N` per stage plus the twin drafter; 0 = off,
+the engine behaves as today).
+
+- **Admission**: a request arrives while one decodes in X and Y is free -> after its current window the decoding one
+  moves X -> Y (conversation snapshot save of its sessions and draft K/V to host, restore into Y), the new one is read
+  into X as today, then both decode in lock-step batch windows [X | Y].
+- **Release**: the one in Y ends -> Y is free (its state is parked in the conversation cache like any finished
+  request, so its next turn resumes).  The one in X ends while Y decodes -> Y's request moves back to X (or the next
+  queued request is read into X first).
+- **Not batched** (waits as today): a request that has to move to Y but does not fit its cells, GENI (images).
+- **Per sequence**: sampling (temperature/top-p/top-k/min-p, its own seed and counter, penalties with its own
+  history) in the batch window's head, adaptive window width (`--spec-min-p`), drafts; suffix/lookup drafts stay
+  single-sequence only.
+- **Protocol**: unchanged without ids.  `GEN ... id=N` tags a request; the engine then answers `T@N`, `PP@N`,
+  `DONE@N`, `ERR@N`, and `STOP N` stops one.  `READY ... batch2` announces it.
+- **server.py**: up to two requests in flight to a batch2 engine (the FIFO admits the second), lines demultiplexed by
+  id; MockEngine + tests.
+
+Sub-steps: M3a per-segment sampling in the verifier (+ parity test, sampled); M3b engine scheduler and protocol
+(+ engine test with two piped requests); M3c server.py; M3d rollout behind the flag, measurement with parallel agents.
