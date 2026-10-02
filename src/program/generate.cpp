@@ -4313,7 +4313,9 @@ int main(int argc, char** argv) {
                 for (int q = 0; q < 2; ++q) {
                     zero_all();
                     zero_drafters();
-                    std::vector<int32_t> window((size_t) Sq), outv((size_t) Sq), drafts((size_t) Sq, 0);
+                    // draft() fills its drafter's whole width (max_t - 1): the buffers are as wide as the verifier's
+                    const size_t W = (size_t) ver.max_window();
+                    std::vector<int32_t> window(W), outv(W), drafts(W, 0);
                     int64_t p = 0;
                     int32_t x = tok0[q];
                     int T = 1;
@@ -4345,7 +4347,8 @@ int main(int argc, char** argv) {
                 zero_all();
                 zero_drafters();
                 std::vector<int32_t> both[2];
-                std::vector<int32_t> drafts[2] = {std::vector<int32_t>((size_t) Sq, 0), std::vector<int32_t>((size_t) Sq, 0)};
+                const size_t W = (size_t) ver.max_window();
+                std::vector<int32_t> drafts[2] = {std::vector<int32_t>(W, 0), std::vector<int32_t>(W, 0)};
                 std::vector<int32_t> window((size_t) 2 * Sq), outv((size_t) 2 * Sq);
                 int64_t p[2] = {0, 0};
                 int32_t x[2] = {tok0[0], tok0[1]};
