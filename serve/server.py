@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import base64
 import hashlib
 import hmac
 import codecs
 import ctypes
+import itertools
 import json
 import os
 import queue
@@ -221,6 +223,11 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.batch2 = False              # it decodes two tagged requests together (READY <ctx> ... batch2)
+        self.tagged = {}                 # batch-2: request id -> the queue of its lines (T@id, DONE@id, ...)
+        self.tagged_lock = threading.Lock()
+        self.next_id = itertools.count(1)
+        self.done_local = threading.local()   # the DONE of the request this thread ran (concurrent requests)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -254,6 +261,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.batch2 = "batch2" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -271,10 +279,21 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         for line in proc.stdout:
+            head, at, rest = line.partition("@")
+            if at and head in ("T", "PP", "REUSED", "DONE", "ERR"):   # batch-2: a tagged request's line
+                rid, _, tail = rest.partition(" ")
+                with self.tagged_lock:
+                    q = self.tagged.get(int(rid)) if rid.isdigit() else None
+                if q is not None:
+                    q.put(f"{head} {tail}" if tail else head + "\n")
+                continue                                # a finished request's late line: nobody reads it
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
         lines.put(None)
+        with self.tagged_lock:
+            for q in self.tagged.values():
+                q.put(None)
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -330,6 +349,8 @@ class StrataEngine:
         f = line.split()
         self.last = {"generated": int(f[1]), "prompt_tokens": int(f[2]), "prompt_ms": float(f[3]),
                      "decode_ms": float(f[4]), "finish": f[5]}
+        if hasattr(self, "done_local"):
+            self.done_local.last = self.last
         if len(f) >= 9:                                   # the conversation cache's fields (engine 0.1.3+)
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
@@ -400,16 +421,27 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        # batch-2: a text request is tagged, so it can run beside another one; its lines come on its own queue
+        rid = next(self.next_id) if getattr(self, "batch2", False) and not embeddings else None
+        lines = self.lines
+        if rid is not None:
+            head += f" id={rid}"
+            lines = queue.Queue()
+            with self.tagged_lock:
+                self.tagged[rid] = lines
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died (not the client)
+            if rid is not None:
+                with self.tagged_lock:
+                    self.tagged.pop(rid, None)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         try:
             while True:
                 try:
-                    line = self.lines.get(timeout=10)
+                    line = lines.get(timeout=10)
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -441,17 +473,20 @@ class StrataEngine:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
+                        self.proc.stdin.write("STOP\n" if rid is None else f"STOP {rid}\n")
                         self.proc.stdin.flush()
                     except OSError:
                         pass
                 while True:
-                    line = self.lines.get()
+                    line = lines.get()
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+            if rid is not None:
+                with self.tagged_lock:
+                    self.tagged.pop(rid, None)
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
@@ -739,6 +774,11 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        # batch-2: requests decoding right now - one at a time, two with an engine that batches (READY ... batch2);
+        # the FIFO still admits them in order
+        self.active = 0
+        self.slot_cv = threading.Condition(self.status_lock)
+        self.load_lock = threading.RLock()               # one start of the engine at a time
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -753,6 +793,33 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    @contextlib.contextmanager
+    def decode_slot(self):
+        """A request's turn: admitted in FIFO order, then a decode slot - one, or two when the engine batches."""
+        with self.fifo:
+            cap = 2 if getattr(self.engine, "batch2", False) else 1
+            with self.slot_cv:
+                while self.active >= cap:
+                    self.slot_cv.wait()
+                self.active += 1
+        try:
+            yield
+        finally:
+            with self.slot_cv:
+                self.active -= 1
+                self.slot_cv.notify_all()
+
+    def wait_idle(self):
+        """No request decoding (the caller holds self.fifo, so none starts)."""
+        with self.slot_cv:
+            while self.active:
+                self.slot_cv.wait()
+
+    def engine_last(self):
+        """The DONE of the request this thread ran (an engine that batches finishes two at once), else the engine's."""
+        local = getattr(self.engine, "done_local", None)
+        return getattr(local, "last", None) if local is not None else getattr(self.engine, "last", None)
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -815,6 +882,10 @@ class Service:
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
+        with self.load_lock:
+            self._ensure_loaded()
+
+    def _ensure_loaded(self):
         if self.loaded() and not self._vision_down():
             return
         if self.before_load:
@@ -880,7 +951,7 @@ class Service:
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if self.status.get("busy") or self.status.get("queued") or self.active:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
@@ -1109,6 +1180,7 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
+                self.wait_idle()
                 encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
@@ -1207,13 +1279,13 @@ class Service:
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
+        engine_last0 = self.engine_last()
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         with self.status_lock:
             self.status["queued"] += 1
         try:
-            with self.fifo:
+            with self.decode_slot():
                 try:
                     with self.status_lock:
                         if trace is not None:
@@ -1228,7 +1300,7 @@ class Service:
                                            max_tokens=max_new)
                         self.last_request_at = time.time()
                         self.rate.clear()               # the previous request's samples must not leak into this one
-                    before = getattr(self.engine, "last", None)
+                    before = self.engine_last()
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     while True:
@@ -1313,8 +1385,7 @@ class Service:
                         if self.status.get("busy"):
                             # only this request's DONE counts: same object means no DONE arrived (death, error,
                             # disconnect)
-                            last = dict(getattr(self.engine, "last", {}) or {}) \
-                                if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            last = dict(self.engine_last() or {}) if self.engine_last() is not engine_last0 else {}
                             started = self.status.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -1337,7 +1408,7 @@ class Service:
                             t["output_tokens"] += n
                             t["prompt_ms"] += last.get("prompt_ms") or 0.0
                             t["decode_ms"] += last.get("decode_ms") or 0.0
-                            fresh = getattr(self.engine, "last", None)
+                            fresh = self.engine_last()
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(len(ids), n, last)
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
@@ -1351,7 +1422,7 @@ class Service:
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
-                        self.status["busy"] = False
+                        self.status["busy"] = self.active > 1           # batch-2: the other request goes on
                         self.status.pop("tail", None)            # #212: the answer's end is not kept once it is done
                         self.status.pop("tool", None)
         finally:

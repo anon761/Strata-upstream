@@ -1775,3 +1775,124 @@ class AmdTelemetry(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FAKE_BATCH2 = '''import sys, threading, time
+print("READY 4096 stop batch2", flush=True)
+lock, stops = threading.Lock(), set()
+
+
+def out(s):
+    with lock:
+        sys.stdout.write(s + "\\n")
+        sys.stdout.flush()
+
+
+def run(rid, n, first):
+    for k in range(n):
+        if rid in stops:
+            out(f"DONE@{rid} {k} 3 0.0 0.0 cancel 0 0 0")
+            return
+        out(f"T@{rid} {first + k}")
+        time.sleep(0.01)
+    out(f"DONE@{rid} {n} 3 0.0 0.0 length 0 0 0")
+
+
+for line in sys.stdin:
+    if line.startswith("QUIT"):
+        break
+    if line.startswith("STOP "):
+        stops.add(int(line.split()[1]))
+        continue
+    f = line.split()
+    if f and f[0] == "GEN":
+        rid = int(next(x for x in f if x.startswith("id="))[3:])
+        threading.Thread(target=run, args=(rid, int(f[1]), int(f[-1].split(",")[0]))).start()
+'''
+
+
+class Batch2Protocol(unittest.TestCase):
+    """docs/BATCH2.md: an engine that says READY ... batch2 gets tagged requests (GEN ... id=N); two run at once and
+    each reads only its own T@N / DONE@N lines; a consumer that stops early sends STOP N and drains its own DONE."""
+
+    def test_two_tagged_requests_at_once(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "fake_batch2.py"
+            script.write_text(FAKE_BATCH2, encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                eng = StrataEngine("strata", [])
+            try:
+                self.assertTrue(eng.batch2)
+                got, spans = {}, {}
+
+                def one(first):
+                    t0 = time.time()
+                    got[first] = [t for t in eng.generate([first], 30, {}, threading.Event()) if t is not None]
+                    spans[first] = (t0, time.time())
+
+                threads = [threading.Thread(target=one, args=(f,)) for f in (100, 500)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(20)
+                self.assertEqual(got[100], list(range(100, 130)))
+                self.assertEqual(got[500], list(range(500, 530)))
+                self.assertLess(max(s[0] for s in spans.values()), min(s[1] for s in spans.values()),
+                                "the two requests did not run at the same time")
+                # stopping one early: STOP <id>, its own DONE drained, and the next request reads only its lines
+                gen = eng.generate([700], 1000, {}, threading.Event())
+                self.assertEqual([next(gen) for _ in range(3)], [700, 701, 702])
+                gen.close()
+                self.assertEqual(eng.done_local.last["finish"], "cancel")
+                self.assertEqual([t for t in eng.generate([900], 5, {}, threading.Event()) if t is not None],
+                                 [900, 901, 902, 903, 904])
+            finally:
+                eng.unload()
+
+
+class Batch2Slots(unittest.TestCase):
+    """The service lets two requests decode at once only with an engine that batches; the FIFO still orders them."""
+
+    class Counting(MockEngine):
+        def __init__(self, *a, batch2=False, **k):
+            super().__init__(*a, **k)
+            self.batch2, self.lock, self.now, self.peak = batch2, threading.Lock(), 0, 0
+
+        def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+            with self.lock:
+                self.now += 1
+                self.peak = max(self.peak, self.now)
+            try:
+                for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                    time.sleep(0.01)
+                    yield t
+            finally:
+                with self.lock:
+                    self.now -= 1
+
+    def peak(self, batch2):
+        tok = ByteTokenizer()
+        eng = self.Counting(tok, "</think>\n\n" + "z" * 30, max_context=CTX, batch2=batch2)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids = tok.encode("hi")
+        done = []
+        threads = [threading.Thread(target=lambda: done.append(list(svc.run(ids, True, None, 25, {}, threading.Event()))))
+                   for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(len(done), 3)
+        self.assertTrue(all(out[-1][1]["completion_tokens"] == 25 for out in done))
+        self.assertEqual(svc.active, 0)
+        self.assertFalse(svc.status["busy"])
+        return eng.peak
+
+    def test_one_at_a_time_without_batch2(self):
+        self.assertEqual(self.peak(False), 1)
+
+    def test_two_at_once_with_batch2(self):
+        self.assertEqual(self.peak(True), 2)
