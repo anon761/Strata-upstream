@@ -98,6 +98,14 @@ public:
         hist_len_ = history_len;
         if (next_) next_->set_history(history, history_len);
     }
+    /// Batch-2: the second sequence's sampling and penalty history (its rows of a batch window, the same layout as
+    /// set_history's).  The first sequence keeps set_sampling / set_history.
+    void set_batch_sampling(const strata::kernels::SamplerParams& sp, const int32_t* history, int history_len) {
+        sampling2_ = sp;
+        hist2_d_ = history;
+        hist2_len_ = history_len;
+        if (next_) next_->set_batch_sampling(sp, history, history_len);
+    }
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
@@ -128,8 +136,8 @@ public:
     bool set_batch_session(SessionState* second, std::string& err);
     /// One window over two sequences: tokens [0, ta) continue sequence 0 at pos0[0], tokens [ta, T) sequence 1 at
     /// pos0[1].  The dense projections, the router and the experts run once over all T tokens; the mixer's state
-    /// (GDN recurrence, QSA K/V and indexer, PLE history) is each sequence's own.  `out[t]` = the head's greedy pick
-    /// after token t - per-sequence sampling and penalties are not wired yet (refused).
+    /// (GDN recurrence, QSA K/V and indexer, PLE history) is each sequence's own.  `out[t]` = the head's pick after
+    /// token t, each sequence's rows sampled with its own parameters (set_sampling / set_batch_sampling).
     bool run_batch(int T, int ta, const int32_t* tokens, const int64_t pos0[2], PoolMultiFn pool, void* user,
                    int32_t* out, std::string& err);
     /// Keeps the first n_keep[s] (1..its segment) tokens of each sequence of the last batch window.
@@ -194,6 +202,9 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    strata::kernels::SamplerParams sampling2_ = sampling_;   ///< batch-2: the second sequence's (set_batch_sampling)
+    const int32_t* hist2_d_ = nullptr;
+    int hist2_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows

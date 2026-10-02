@@ -1118,10 +1118,6 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
     const int64_t pos0 = a.pos0[0];
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
-    if (a.ta > 0 && head_sampling_ && ((!sampling_.greedy && sampling_.temperature > 0.0f) || hist_d_ != nullptr)) {
-        err = "verify: a batch window samples greedily only (per-sequence sampling is not wired yet)";
-        return false;
-    }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     // row t's sequence and position: one sequence from pos0, or two (rows [ta, T) continue the second at pos0[1])
@@ -1297,15 +1293,28 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
         ++windows;
         return next_ == nullptr || next_->run_window(a, pool, next_user_, out, err);
     }
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {
-        SamplerParams sp = sampling_;
-        sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
-            return false;
+    // a batch window samples each sequence's rows with its own parameters, draws and history; a greedy one keeps
+    // the graph's argmax
+    auto sample_rows = [&](const SamplerParams& spq, const int32_t* hist, int hist_len, int b, int n, int64_t p0) {
+        if ((spq.greedy || spq.temperature <= 0.0f) && hist == nullptr) return false;
+        SamplerParams sp = spq;
+        sp.counter = (uint64_t) p0;
+        sample_tokens(head_logits_ + (size_t) b * (size_t) n_vocab_, n, (int) n_vocab_, hist, hist_len, sp, m_out_ + b,
+                      cs_);
+        return true;
+    };
+    bool sampled_any = false;
+    if (head_sampling_) {
+        if (a.ta == 0) {
+            sampled_any = sample_rows(sampling_, hist_d_, hist_len_, 0, T, pos0);
+        } else {
+            sampled_any = sample_rows(sampling_, hist_d_, hist_len_, 0, a.ta, a.pos0[0]);
+            sampled_any = sample_rows(sampling2_, hist2_d_, hist2_len_, a.ta, T - a.ta, a.pos0[1]) || sampled_any;
         }
+    }
+    if (sampled_any && cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, readable
+        err = "verify: the head sampling failed";
+        return false;
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head

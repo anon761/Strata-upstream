@@ -4291,10 +4291,43 @@ int main(int argc, char** argv) {
                 }
                 mtp.set_max_drafts(Sq - 1);
                 twin.set_max_drafts(Sq - 1);
-                strata::kernels::SamplerParams greedy;
-                greedy.greedy = true;
-                ver.set_sampling(greedy);
-                ver.set_history(nullptr, 0);
+                // STRATA_BATCH2_TEMP=<t> samples (top-p 0.95, top-k 20, a seed per sequence), STRATA_BATCH2_PENALTY=<r>
+                // adds a repetition penalty over the last 64 tokens (its history staged per row as the serve loop does)
+                const char* te = std::getenv("STRATA_BATCH2_TEMP");
+                const char* pe = std::getenv("STRATA_BATCH2_PENALTY");
+                const float temp = te ? (float) std::atof(te) : 0.0f, pen = pe ? (float) std::atof(pe) : 1.0f;
+                strata::kernels::SamplerParams spq[2];
+                for (int q = 0; q < 2; ++q) {
+                    spq[q].greedy = temp <= 0.0f;
+                    spq[q].temperature = temp;
+                    spq[q].seed = 1234 + (uint64_t) q;
+                    if (pen != 1.0f) {
+                        spq[q].penalty_last_n = 64;
+                        spq[q].penalty_repeat = pen;
+                    }
+                }
+                const int hist_n = pen != 1.0f ? 64 : 0;
+                const size_t Wv = (size_t) ver.max_window();
+                int32_t* d_h[2] = {nullptr, nullptr};
+                std::vector<int32_t> h_stage(Wv * (size_t) std::max(hist_n, 1));
+                if (hist_n > 0) {
+                    const strata::core::OnDevice on(mtp.device());   // the head's device (the last stage)
+                    for (auto& d : d_h)
+                        if (cudaMalloc((void**) &d, Wv * (size_t) hist_n * 4) != cudaSuccess) {
+                            std::fprintf(stderr, "strata batch2: the history buffers failed\n");
+                            return 1;
+                        }
+                }
+                std::vector<int32_t> consumed[2];
+                // the row histories of a window's n rows of sequence q into history buffer `buf`: what q consumed,
+                // then the window's tokens
+                auto stage_hist = [&](int q, int buf, const int32_t* rows, int n) {
+                    if (hist_n == 0) return;
+                    strata::kernels::penalty_rows(consumed[q].data(), (int64_t) consumed[q].size(), rows, n, hist_n,
+                                                  h_stage.data());
+                    const strata::core::OnDevice on(mtp.device());
+                    cudaMemcpy(d_h[buf], h_stage.data(), (size_t) n * (size_t) hist_n * 4, cudaMemcpyHostToDevice);
+                };
                 strata::core::MtpDrafter* const drafter[2] = {&mtp, &twin};
                 auto zero_drafters = [&] {
                     const strata::core::OnDevice on(mtp.device());
@@ -4313,6 +4346,9 @@ int main(int argc, char** argv) {
                 for (int q = 0; q < 2; ++q) {
                     zero_all();
                     zero_drafters();
+                    ver.set_sampling(spq[q]);
+                    ver.set_history(d_h[0], hist_n);
+                    consumed[q].clear();
                     // draft() fills its drafter's whole width (max_t - 1): the buffers are as wide as the verifier's
                     const size_t W = (size_t) ver.max_window();
                     std::vector<int32_t> window(W), outv(W), drafts(W, 0);
@@ -4323,6 +4359,7 @@ int main(int argc, char** argv) {
                     while ((int) alone[q].size() < max_new) {
                         window[0] = x;
                         for (int i = 1; i < T; ++i) window[(size_t) i] = drafts[(size_t) i - 1];
+                        stage_hist(q, 0, window.data(), T);   // alone: the first sequence's buffer
                         if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err)) {
                             std::fprintf(stderr, "strata batch2: alone %d: %s\n", q, err.c_str());
                             return 1;
@@ -4334,6 +4371,7 @@ int main(int argc, char** argv) {
                             return 1;
                         }
                         alone[q].insert(alone[q].end(), outv.begin(), outv.begin() + a + 1);
+                        consumed[q].insert(consumed[q].end(), window.begin(), window.begin() + a + 1);
                         ++win_serial;
                         acc_serial += a;
                         x = outv[(size_t) a];
@@ -4346,6 +4384,11 @@ int main(int argc, char** argv) {
                 // both in lock-step
                 zero_all();
                 zero_drafters();
+                ver.set_sampling(spq[0]);
+                ver.set_history(d_h[0], hist_n);
+                ver.set_batch_sampling(spq[1], d_h[1], hist_n);
+                consumed[0].clear();
+                consumed[1].clear();
                 std::vector<int32_t> both[2];
                 const size_t W = (size_t) ver.max_window();
                 std::vector<int32_t> drafts[2] = {std::vector<int32_t>(W, 0), std::vector<int32_t>(W, 0)};
@@ -4361,6 +4404,8 @@ int main(int argc, char** argv) {
                     for (int i = 1; i < T[0]; ++i) window[(size_t) i] = drafts[0][(size_t) i - 1];
                     window[(size_t) ta] = x[1];
                     for (int i = 1; i < T[1]; ++i) window[(size_t) (ta + i)] = drafts[1][(size_t) i - 1];
+                    stage_hist(0, 0, window.data(), T[0]);
+                    stage_hist(1, 1, window.data() + ta, T[1]);
                     if (!ver.run_batch(T[0] + T[1], ta, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err)) {
                         std::fprintf(stderr, "strata batch2: batch window %lld: %s\n", (long long) win_batch, err.c_str());
                         return 1;
@@ -4382,6 +4427,7 @@ int main(int argc, char** argv) {
                     for (int q = 0; q < 2; ++q) {
                         const int b = q == 0 ? 0 : ta;
                         both[q].insert(both[q].end(), outv.begin() + b, outv.begin() + b + a[q] + 1);
+                        consumed[q].insert(consumed[q].end(), window.begin() + b, window.begin() + b + a[q] + 1);
                         acc_batch += a[q];
                         x[q] = outv[(size_t) (b + a[q])];
                         p[q] += a[q] + 1;
@@ -4393,8 +4439,10 @@ int main(int argc, char** argv) {
                 for (int q = 0; q < 2; ++q)
                     for (int i = 0; i < max_new; ++i) differ += both[q][(size_t) i] != alone[q][(size_t) i];
                 const int64_t made = (int64_t) both[0].size() + (int64_t) both[1].size();
-                std::fprintf(stderr, "strata batch2 decode: %d tokens x 2 sequences, windows of %d per sequence: %d tokens "
-                                     "differ from the sequences alone - %s\n", max_new, Sq, differ, differ == 0 ? "PASS" : "FAIL");
+                std::fprintf(stderr, "strata batch2 decode: %d tokens x 2 sequences, windows of %d per sequence, %s%s: %d "
+                                     "tokens differ from the sequences alone - %s\n", max_new, Sq,
+                             temp > 0.0f ? "sampled" : "greedy", hist_n > 0 ? " + repetition penalty" : "", differ,
+                             differ == 0 ? "PASS" : "FAIL");
                 std::fprintf(stderr, "strata batch2 decode: alone %.1f tok/s (%lld windows, %.2f drafts kept per window), "
                                      "lock-step %.1f tok/s for both (%lld windows, %.2f drafts kept per sequence and window)\n",
                              (double) (alone[0].size() + alone[1].size()) * 1000.0 / ms_serial, (long long) win_serial,
