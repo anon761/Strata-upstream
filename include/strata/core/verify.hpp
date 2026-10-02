@@ -135,12 +135,13 @@ public:
     /// `init` got), its own state.  Null switches batch windows off.  Before the first `run_batch`.
     bool set_batch_session(SessionState* second, std::string& err);
     /// One window over two sequences: tokens [0, ta) continue sequence 0 at pos0[0], tokens [ta, T) sequence 1 at
-    /// pos0[1].  The dense projections, the router and the experts run once over all T tokens; the mixer's state
+    /// pos0[1] (ta = 0: a window of the second sequence alone).  The dense projections, the router and the experts run once over all T tokens; the mixer's state
     /// (GDN recurrence, QSA K/V and indexer, PLE history) is each sequence's own.  `out[t]` = the head's pick after
     /// token t, each sequence's rows sampled with its own parameters (set_sampling / set_batch_sampling).
     bool run_batch(int T, int ta, const int32_t* tokens, const int64_t pos0[2], PoolMultiFn pool, void* user,
                    int32_t* out, std::string& err);
-    /// Keeps the first n_keep[s] (1..its segment) tokens of each sequence of the last batch window.
+    /// Keeps the first n_keep[s] (1..its segment; 0 for a sequence without rows) tokens of each sequence of the last
+    /// batch window.
     bool commit_batch(const int n_keep[2], std::string& err);
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
@@ -187,13 +188,13 @@ private:
     /// What one window covers: T tokens, and with ta > 0 two sequences (tokens [0, ta) and [ta, T)).
     struct WindowArgs {
         int T = 0;
-        int ta = 0;                  ///< 0: one sequence (`run`); else the second sequence's first token
+        int ta = -1;                 ///< -1: one sequence (`run`); else the second sequence's first row (0..T-1)
         const int32_t* tokens = nullptr;
         int64_t pos0[2] = {0, 0};   ///< each sequence's first position
     };
     bool run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     bool capture(int T, std::string& err);
-    bool capture_window(int T, int ta, cudaGraphExec_t* slot, std::string& err);
+    bool capture_window(int T, int ta, cudaGraphExec_t* slot, std::string& err);   ///< ta: as WindowArgs::ta
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -247,13 +248,13 @@ private:
     // Batch-2: the second sequence's session, the split the window being recorded uses, the batch windows'
     // graphs per [ta][T], the second sequence's commit graph per ta, and its own commit array and tail snapshot
     SessionState* ss2_ = nullptr;
-    int rec_ta_ = 0;
+    int rec_split_ = -1;
     cudaGraphExec_t exec_b_[9][9] = {};
     cudaGraphExec_t commit_b_exec_[9] = {};
     int32_t* h_commit2_ = nullptr; int32_t* m_commit2_ = nullptr;
     int32_t* commit2_ = nullptr;
     float* tail_snap2_ = nullptr;
-    int last_ta_ = 0;
+    int last_split_ = 0;
     int64_t last_pos0b_[2] = {0, 0};
 
     // mapped staging (host pointer, device alias)

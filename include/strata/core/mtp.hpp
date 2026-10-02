@@ -45,9 +45,13 @@ public:
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
     /// Batch-2 (docs/BATCH2.md): this drafter drafts for a second sequence over `base`'s weights and draft head
-    /// (`base` loaded and bound, and outliving this one): its own K/V for `ss` (that sequence's session on base's
-    /// device), round buffers, logits and stream.  Its window rows come from stage_rows, not from the verifier.
+    /// (`base` outlives it): load_twin after base's load gives it its own K/V for `ss` (that sequence's session on
+    /// base's device), round buffers and stream; bind_twin after base's bind its head, logits and window rows (those
+    /// come from stage_rows, not from the verifier).
     bool load_twin(const MtpDrafter& base, SessionState& ss, std::string& err);
+    bool bind_twin(const MtpDrafter& base, std::string& err);
+    /// The VRAM bind_twin allocates (reserve it before the expert cache is sized).
+    uint64_t bind_twin_bytes(int64_t n_vocab) const;
     /// A twin's window rows: `n` final residual rows (device, hc*n_embd each) - the second sequence's rows of a
     /// batch window - before its draft().
     bool stage_rows(const float* rows, int n, std::string& err);

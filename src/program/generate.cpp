@@ -383,6 +383,7 @@ struct Options {
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
+    int64_t batch2_cells = 0;           ///< --batch2-cells: the second sequence slot's context (0: no batch-2 decode)
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -504,6 +505,8 @@ void usage() {
                  "                       larger than the budget is not parked.  Needs --prompt-cache > 0.\n"
                  "                       Example: --conversation-cache-mib 16384 (16 GiB)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --batch2-cells N     --serve: decode two tagged requests (GEN ... id=N) together; the second\n"
+                 "                       sequence's slot holds N cells (needs --mtp; docs/BATCH2.md)\n"
                  "  --conversation-cache-min-free-mib N  --serve: never park when it would leave less than N MiB of\n"
                  "                       physical RAM free (default 2560), whatever the budget allows\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
@@ -706,6 +709,7 @@ struct GpuStage {
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
     strata::core::SessionState ss;
+    strata::core::SessionState ss2;                      ///< --batch2-cells: the second sequence's session (slot Y)
     cudaStream_t stream = nullptr;
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
@@ -1141,6 +1145,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-until") o.prefill_until = std::atoll(next("--prefill-until"));
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--batch2-cells") o.batch2_cells = std::atoll(next("--batch2-cells"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -1264,6 +1269,11 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_coupled_draft(o.coupled_draft);
+    if (o.batch2_cells != 0 && (!o.serve || o.mtp.empty() || o.vision || o.batch2_cells < 4096 || o.coupled_draft)) {
+        std::fprintf(stderr, "strata generate: --batch2-cells needs --serve and --mtp, at least 4096 cells, and neither "
+                             "--vision nor coupled drafts\n");
+        return 2;
+    }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
@@ -1968,6 +1978,7 @@ int main(int argc, char** argv) {
     }
 
     strata::core::SessionState ss;
+    strata::core::SessionState ss2;   // --batch2-cells: the second sequence's session on CUDA0 (slot Y)
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
     // calls - `session_capture`, `session_replay`, `session_token` and `session_loop` - were handed `nullptr`,
@@ -2353,7 +2364,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le);
+                capr[(size_t) i] = cap[(size_t) i] - (int64_t) strata::core::session_bytes(g, o.max_context, K, lb, le) -
+                                   (o.batch2_cells > 0 ? (int64_t) strata::core::session_bytes(g, o.batch2_cells, K, lb, le) : 0);
             }
             std::fill(used.begin(), used.end(), 0);
             held_mass = 0;
@@ -2497,9 +2509,50 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    // ---- --batch2-cells: slot Y, the second sequence's sessions over the same layer ranges (docs/BATCH2.md).  Before
+    // the expert caches are sized, so they leave room for it.
+    if (o.batch2_cells > 0) {
+        uint64_t total = 0;
+        {
+            const strata::core::OnDevice on0(0);
+            const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+            const uint64_t bytes = strata::core::session_bytes(g, o.batch2_cells, K, 0, hi0);
+            void* b2 = nullptr;
+            if (cudaMalloc(&b2, bytes) != cudaSuccess || strata::core::session_init(g, o.batch2_cells, K, b2, ss2, 0, hi0) == 0) {
+                std::fprintf(stderr, "strata generate: --batch2-cells: the second session does not fit on CUDA0\n");
+                return 1;
+            }
+            ss2.ple = ss.ple;   // the table, weights and scratch are shared; the history and the n-gram are its own
+            ss2.ple.hist = ss2.ple_hist;
+            ss2.ple.token = &ss2.ple_token;
+            ss2.ple.prev = ss2.ple_prev;
+            strata::core::session_zero(ss2, g, nullptr, main_cs);
+            total += bytes;
+        }
+        for (auto& st : stages) {
+            const strata::core::OnDevice on(st->dev);
+            const uint64_t bytes = strata::core::session_bytes(g, o.batch2_cells, K, st->lb, st->le);
+            void* b2 = nullptr;
+            if (cudaMalloc(&b2, bytes) != cudaSuccess ||
+                strata::core::session_init(g, o.batch2_cells, K, b2, st->ss2, st->lb, st->le) == 0) {
+                std::fprintf(stderr, "strata generate: --batch2-cells: the second session does not fit on CUDA%d\n", st->dev);
+                return 1;
+            }
+            strata::core::session_zero(st->ss2, g, nullptr, (void*) st->stream);
+            total += bytes;
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: --batch2-cells: zeroing the second session failed\n");
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: batch-2: a second sequence slot of %lld cells, %.0f MiB of VRAM\n",
+                     (long long) o.batch2_cells, (double) total / 1048576.0);
+    }
+
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
+    strata::core::MtpDrafter twin;   // --batch2-cells: the second sequence's drafter over mtp's weights
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -2512,6 +2565,10 @@ int main(int argc, char** argv) {
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        if (o.batch2_cells > 0 && !twin.load_twin(mtp, last_st ? last_st->ss2 : ss2, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -2675,7 +2732,9 @@ int main(int argc, char** argv) {
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
-                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
+                                     ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) +
+                                           (o.batch2_cells > 0 ? (int64_t) twin.bind_twin_bytes(n_vocab) : 0)
+                                     : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
@@ -4140,6 +4199,11 @@ int main(int argc, char** argv) {
         };
         auto pcie_num_of = [](double f) { return std::max(0, std::min(256, (int) (f * 256.0 + 0.5))); };
         const int n_stages = split_devs.empty() ? 1 : (int) split_at.size() + 1;
+        // batch-2 windows hold two MTP windows: the verifier is that wide (at most kVerifyMaxT)
+        const int ver_max_t = o.batch2_cells > 0
+                                  ? std::max(o.spec, std::min(2 * (o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec),
+                                                              strata::kernels::kVerifyMaxT))
+                                  : o.spec;
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -4166,7 +4230,7 @@ int main(int argc, char** argv) {
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
-                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err);
+                    ok_s = ver_same.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err);
                 } else {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
@@ -4176,7 +4240,7 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
-                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err);
+                    ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, ver_max_t, err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -4193,10 +4257,19 @@ int main(int argc, char** argv) {
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
-            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ver_max_t, err) ||
+            !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err) ||
+            (o.batch2_cells > 0 && !twin.bind_twin(mtp, err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
+        }
+        // batch-2: every stage's verifier gets its layer range's slot-Y session
+        for (int st = 0; st < n_stages && o.batch2_cells > 0; ++st) {
+            strata::core::SessionState* second = st == 0 || split_same ? &ss2 : &stages[(size_t) st - 1]->ss2;
+            if (!stage_ver(st).set_batch_session(second, err)) {
+                std::fprintf(stderr, "strata serve: batch-2, stage %d: %s\n", st + 1, err.c_str());
+                return 1;
+            }
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
@@ -4215,45 +4288,16 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
-        // ---- Batch-2 self-test (docs/BATCH2.md, branch batch2).  STRATA_BATCH2_SELFTEST=<steps>: two sequences
-        // decoded greedily from empty sessions, first each alone (one-token windows on the first session), then
-        // both together in two-token batch windows (the second on its own session); the picks must agree and the
-        // head's logits must be bitwise equal.  Prints PASS/FAIL and ends the process.
+        // ---- Batch-2 self-test (docs/BATCH2.md, branch batch2), on the engine's slot Y (--batch2-cells).
+        // STRATA_BATCH2_SELFTEST=<steps>: two sequences decoded greedily from empty sessions, first each alone
+        // (one-token windows on the first session), then both together in batch windows (the second on slot Y); the
+        // picks must agree and the head's logits must be bitwise equal.  Prints PASS/FAIL and ends the process.
         if (const char* bt = std::getenv("STRATA_BATCH2_SELFTEST"); bt != nullptr) {
             const int steps = std::max(1, std::atoi(bt));
-            const int64_t cells = std::min<int64_t>(o.max_context, 4096);
             const int32_t tok0[2] = {9707, 785};   // any two ids: the test compares the engine with itself
-            strata::core::SessionState ss2;
-            std::vector<strata::core::SessionState> st_ss2(stages.size());
-            {
-                const strata::core::OnDevice on0(0);
-                const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-                void* b2 = nullptr;
-                if (cudaMalloc(&b2, strata::core::session_bytes(g, cells, K, 0, hi0)) != cudaSuccess ||
-                    strata::core::session_init(g, cells, K, b2, ss2, 0, hi0) == 0) {
-                    std::fprintf(stderr, "strata batch2: the second session failed\n");
-                    return 1;
-                }
-                ss2.ple = ss.ple;   // the table, weights and scratch are shared; the history and the n-gram are its own
-                ss2.ple.hist = ss2.ple_hist;
-                ss2.ple.token = &ss2.ple_token;
-                ss2.ple.prev = ss2.ple_prev;
-            }
-            for (size_t i = 0; i < stages.size(); ++i) {
-                const strata::core::OnDevice on(stages[i]->dev);
-                void* b2 = nullptr;
-                if (cudaMalloc(&b2, strata::core::session_bytes(g, cells, K, stages[i]->lb, stages[i]->le)) != cudaSuccess ||
-                    strata::core::session_init(g, cells, K, b2, st_ss2[i], stages[i]->lb, stages[i]->le) == 0) {
-                    std::fprintf(stderr, "strata batch2: the second session of CUDA%d failed\n", stages[i]->dev);
-                    return 1;
-                }
-            }
-            for (int st = 0; st < n_stages; ++st) {
-                strata::core::SessionState* second = st == 0 || split_same ? &ss2 : &st_ss2[(size_t) st - 1];
-                if (!stage_ver(st).set_batch_session(second, err)) {
-                    std::fprintf(stderr, "strata batch2: stage %d: %s\n", st + 1, err.c_str());
-                    return 1;
-                }
+            if (o.batch2_cells <= 0) {
+                std::fprintf(stderr, "strata batch2: the self-test runs on the engine's second slot (--batch2-cells)\n");
+                return 1;
             }
             auto zero_all = [&] {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -4262,7 +4306,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {
                     const strata::core::OnDevice on(stages[i]->dev);
                     strata::core::session_zero(stages[i]->ss, g, nullptr, (void*) stages[i]->stream);
-                    strata::core::session_zero(st_ss2[i], g, nullptr, (void*) stages[i]->stream);
+                    strata::core::session_zero(stages[i]->ss2, g, nullptr, (void*) stages[i]->stream);
                     cudaStreamSynchronize(stages[i]->stream);
                 }
             };
@@ -4278,16 +4322,6 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch2: two windows of %d do not fit the verifier's %d (raise --spec)\n",
                                  Sq, ver.max_window());
                     return 1;
-                }
-                strata::core::SessionState& last_ss2 =
-                    n_stages == 1 || split_same ? ss2 : st_ss2[(size_t) n_stages - 2];
-                strata::core::MtpDrafter twin;
-                {
-                    const strata::core::OnDevice on(mtp.device());
-                    if (!twin.load_twin(mtp, last_ss2, err)) {
-                        std::fprintf(stderr, "strata batch2: %s\n", err.c_str());
-                        return 1;
-                    }
                 }
                 mtp.set_max_drafts(Sq - 1);
                 twin.set_max_drafts(Sq - 1);
@@ -4480,7 +4514,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch2: STRATA_BATCH2_SPLIT wants na,nb\n");
                 return 1;
             }
-            if (na < 1 || nb < 1 || na + nb > ver.max_window()) {
+            if (na < 0 || nb < 1 || na + nb > ver.max_window()) {   // na = 0: windows of the second sequence alone
                 std::fprintf(stderr, "strata batch2: split %d,%d does not fit the window (%d)\n", na, nb, ver.max_window());
                 return 1;
             }

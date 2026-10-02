@@ -316,7 +316,7 @@ bool MtpDrafter::alloc_runtime(std::string& err) {
 }
 
 bool MtpDrafter::load_twin(const MtpDrafter& base, SessionState& ss, std::string& err) {
-    if (base.dense_ == nullptr || base.head_ == nullptr) { err = "mtp twin: the first drafter is not loaded and bound"; return false; }
+    if (base.dense_ == nullptr) { err = "mtp twin: the first drafter is not loaded"; return false; }
     if (coupled_draft_env()) { err = "mtp twin: coupled draft sampling (STRATA_SPEC_COUPLED) is not wired for batch-2"; return false; }
     const OnDevice on_device(base.device_);
     device_ = base.device_;
@@ -328,14 +328,28 @@ bool MtpDrafter::load_twin(const MtpDrafter& base, SessionState& ss, std::string
     tensors_ = base.tensors_;
     dense_ = base.dense_;
     experts_ = base.experts_;
+    twin_ = true;
+    if (!alloc_runtime(err)) return false;
+    std::fprintf(stderr, "strata mtp: twin drafter for a second sequence, %.0f MiB of VRAM (weights shared)\n",
+                 (double) vram_ / 1048576.0);
+    return true;
+}
+
+uint64_t MtpDrafter::bind_twin_bytes(int64_t n_vocab) const {
+    return (uint64_t) max_t_ * ((uint64_t) n_vocab + (uint64_t) g_->hc * (uint64_t) g_->n_embd) * sizeof(float);
+}
+
+bool MtpDrafter::bind_twin(const MtpDrafter& base, std::string& err) {
+    if (!twin_) { err = "mtp: bind_twin is for a twin"; return false; }
+    if (base.head_ == nullptr) { err = "mtp twin: the first drafter is not bound"; return false; }
+    const OnDevice on_device(device_);
     wt_ = base.wt_;
     head_ = base.head_;
     n_vocab_ = base.n_vocab_;
     dhead_ = base.dhead_;
     dvocab_ = base.dvocab_;
     n_dvocab_ = base.n_dvocab_;
-    twin_ = true;
-    if (!alloc_runtime(err)) return false;
+    if (head_logits_ != nullptr) return true;
     const uint64_t hcn = (uint64_t) g_->hc * (uint64_t) g_->n_embd;
     float* rows = nullptr;
     if (cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess ||
@@ -346,9 +360,7 @@ bool MtpDrafter::load_twin(const MtpDrafter& base, SessionState& ss, std::string
     }
     own_R_ = rows;
     window_R_ = rows;
-    vram_ += (uint64_t) max_t_ * ((uint64_t) n_vocab_ * 4 + hcn * 4);
-    std::fprintf(stderr, "strata mtp: twin drafter for a second sequence, %.0f MiB of VRAM (weights shared)\n",
-                 (double) vram_ / 1048576.0);
+    vram_ += bind_twin_bytes(n_vocab_);
     return true;
 }
 

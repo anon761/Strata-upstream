@@ -408,21 +408,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    // Batch-2 (docs/BATCH2.md): with rec_ta_ > 0 the rows [rec_ta_, T) are a second sequence with its own session.
-    // Everything per row or per weight runs over all T rows as before; what reads or writes a sequence's state
-    // (PLE history, GDN recurrence, QSA K/V and indexer, the commit's tail snapshot) runs per segment.
-    const int TA = rec_ta_;
-    SessionState* const seq_ss[2] = {&ss, TA > 0 ? ss2_ : &ss};
-    float* const seq_tail[2] = {tail_snap_, TA > 0 ? tail_snap2_ : tail_snap_};
-    auto seq_of = [&](int t) { return TA > 0 && t >= TA ? 1 : 0; };
+    // Batch-2 (docs/BATCH2.md): the rows [TB, T) are a second sequence with its own session (TB = T: none, TB = 0:
+    // only the second).  Everything per row or per weight runs over all T rows as before; what reads or writes a
+    // sequence's state (PLE history, GDN recurrence, QSA K/V and indexer, the commit's tail snapshot) runs per segment.
+    const int TB = rec_split_ < 0 ? T : rec_split_;
+    const bool single = TB == T;
+    SessionState* const seq_ss[2] = {&ss, single ? &ss : ss2_};
+    float* const seq_tail[2] = {tail_snap_, single ? tail_snap_ : tail_snap2_};
+    auto seq_of = [&](int t) { return t >= TB ? 1 : 0; };
     struct Seg { int b, e, q; };   // rows [b, e) of sequence q
     auto segs_of = [&](int tb, int te) {
         std::vector<Seg> v;
-        if (TA <= tb || TA >= te) v.push_back({tb, te, seq_of(tb)});
-        else { v.push_back({tb, TA, 0}); v.push_back({TA, te, 1}); }
+        if (TB <= tb || TB >= te) v.push_back({tb, te, seq_of(tb)});
+        else { v.push_back({tb, TB, 0}); v.push_back({TB, te, 1}); }
         return v;
     };
-    const int G = (TA == 0 && split_ && T >= 2) ? 2 : 1;
+    const int G = (single && split_ && T >= 2) ? 2 : 1;
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -557,7 +558,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // as a window of its own, from its own state (the kernels index rows relative to the pointers)
                 for (const Seg& sg : segs_of(tb, te)) {
                     float* conv = state_of(sg.q) + conv_off;
-                    if (TA == 0) gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                    if (single) gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                     else gdn_conv_l2_multi(conv, qkv + (size_t) sg.b * C, (const float*) wc->data, hb + (size_t) sg.b * C,
                                            (int) C, (int) (2 * HK), EPS, sg.e - sg.b, cs, 0);
                 }
@@ -570,7 +571,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 for (const Seg& sg : segs_of(tb, te)) {
-                    if (TA == 0)
+                    if (single)
                         gdn_step_norm_multi(state_of(sg.q), hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_,
                                             (int) HK, (int) HV, te, nullptr, cs, tb);
                     else
@@ -941,7 +942,7 @@ std::string Verifier::profile_report() {
     return out;
 }
 
-bool Verifier::capture(int T, std::string& err) { return capture_window(T, 0, &exec_[T], err); }
+bool Verifier::capture(int T, std::string& err) { return capture_window(T, -1, &exec_[T], err); }
 
 bool Verifier::capture_window(int T, int ta, cudaGraphExec_t* slot, std::string& err) {
     if (*slot != nullptr) return true;
@@ -950,9 +951,9 @@ bool Verifier::capture_window(int T, int ta, cudaGraphExec_t* slot, std::string&
         return false;
     }
     std::string rerr;
-    rec_ta_ = ta;   // record_window reads it: ta > 0 records a batch window (two sequences)
+    rec_split_ = ta;   // record_window reads it: rows [ta, T) belong to the second sequence (-1: none)
     const bool ok = record_window(T, cs_, rerr);
-    rec_ta_ = 0;
+    rec_split_ = -1;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -1003,7 +1004,7 @@ bool Verifier::capture_window(int T, int ta, cudaGraphExec_t* slot, std::string&
     }
     const cudaError_t ue = cudaGraphUpload(*slot, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
-    if (ta > 0)
+    if (ta >= 0)
         std::fprintf(stderr, "strata verify: captured the %d-token batch window, %d + %d (upload %s, sync %s)\n", T, ta,
                      T - ta, cudaGetErrorString(ue), cudaGetErrorString(us));
     else
@@ -1100,7 +1101,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 bool Verifier::run_batch(int T, int ta, const int32_t* tokens, const int64_t pos0[2], PoolMultiFn pool, void* user,
                          int32_t* out, std::string& err) {
     if (ss2_ == nullptr) { err = "verify: no second session for a batch window (set_batch_session)"; return false; }
-    if (ta < 1 || ta >= T) { err = "verify: a batch window needs tokens of both sequences"; return false; }
+    if (ta < 0 || ta >= T) { err = "verify: a batch window needs tokens of the second sequence"; return false; }
     WindowArgs a;
     a.T = T;
     a.ta = ta;
@@ -1121,21 +1122,21 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     // row t's sequence and position: one sequence from pos0, or two (rows [ta, T) continue the second at pos0[1])
-    SessionState* const seq_ss[2] = {&ss, a.ta > 0 ? ss2_ : &ss};
-    auto seq_of = [&](int t) { return a.ta > 0 && t >= a.ta ? 1 : 0; };
-    auto pos_of = [&](int t) { return seq_of(t) == 1 ? a.pos0[1] + (t - a.ta) : pos0 + t; };
-    for (int q = 0; q < (a.ta > 0 ? 2 : 1); ++q) {
-        const int n_q = q == 0 ? (a.ta > 0 ? a.ta : T) : T - a.ta;
-        if (a.pos0[q] + n_q > seq_ss[q]->qsa_states[seq_ss[q]->qsa_primary()].max_cells) {
+    const int TB = a.ta < 0 ? T : a.ta;   // the second sequence's first row (T: none)
+    SessionState* const seq_ss[2] = {&ss, TB < T ? ss2_ : &ss};
+    auto seq_of = [&](int t) { return t >= TB ? 1 : 0; };
+    auto pos_of = [&](int t) { return seq_of(t) == 1 ? a.pos0[1] + (t - TB) : pos0 + t; };
+    const int len[2] = {TB, T - TB};
+    for (int q = 0; q < 2; ++q)
+        if (len[q] > 0 && a.pos0[q] + len[q] > seq_ss[q]->qsa_states[seq_ss[q]->qsa_primary()].max_cells) {
             err = "verify: the window runs past the context";
             return false;
         }
-    }
-    if (a.ta == 0) {
+    if (TB == T) {
         if (!capture(T, err) || !capture_commit(err)) return false;
-    } else if (!capture_window(T, a.ta, &exec_b_[a.ta][T], err) || !capture_commit(err) ||
-               (commit_b_exec_[a.ta] == nullptr &&
-                !record_commit(*ss2_, a.ta, tail_snap2_, commit2_, m_commit2_, &commit_b_exec_[a.ta], err))) {
+    } else if (!capture_window(T, TB, &exec_b_[TB][T], err) || (TB > 0 && !capture_commit(err)) ||
+               (commit_b_exec_[TB] == nullptr &&
+                !record_commit(*ss2_, TB, tail_snap2_, commit2_, m_commit2_, &commit_b_exec_[TB], err))) {
         return false;
     }
     VDBG("captured; staging\n");
@@ -1156,7 +1157,7 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
         uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
-            if (a.ta > 0 && t == a.ta) {
+            if (t == TB) {
                 prev[0] = ss2_->ple_prev[0];
                 prev[1] = ss2_->ple_prev[1];
             }
@@ -1173,19 +1174,19 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
     last_pos0_ = pos0;
-    last_ta_ = a.ta;
+    last_split_ = TB;
     last_pos0b_[0] = a.pos0[0];
     last_pos0b_[1] = a.pos0[1];
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const cudaError_t le = cudaGraphLaunch(a.ta > 0 ? exec_b_[a.ta][T] : exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(TB < T ? exec_b_[TB][T] : exec_[T], cs_);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int G = a.ta == 0 && groups_[T] > 0 ? groups_[T] : 1;   // a batch window is one group
+    const int G = TB == T && groups_[T] > 0 ? groups_[T] : 1;   // a batch window is one group
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
@@ -1305,12 +1306,8 @@ bool Verifier::run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int
     };
     bool sampled_any = false;
     if (head_sampling_) {
-        if (a.ta == 0) {
-            sampled_any = sample_rows(sampling_, hist_d_, hist_len_, 0, T, pos0);
-        } else {
-            sampled_any = sample_rows(sampling_, hist_d_, hist_len_, 0, a.ta, a.pos0[0]);
-            sampled_any = sample_rows(sampling2_, hist2_d_, hist2_len_, a.ta, T - a.ta, a.pos0[1]) || sampled_any;
-        }
+        if (TB > 0) sampled_any = sample_rows(sampling_, hist_d_, hist_len_, 0, TB, pos0);
+        if (TB < T) sampled_any = sample_rows(sampling2_, hist2_d_, hist2_len_, TB, T - TB, a.pos0[1]) || sampled_any;
     }
     if (sampled_any && cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, readable
         err = "verify: the head sampling failed";
@@ -1524,22 +1521,27 @@ bool Verifier::set_batch_session(SessionState* second, std::string& err) {
 
 bool Verifier::commit_batch(const int n_keep[2], std::string& err) {
     const OnDevice on_device(device_);
-    const int ta = last_ta_;
-    if (ta == 0 || ss2_ == nullptr) { err = "verify: the last window was not a batch window"; return false; }
-    const int len[2] = {ta, last_t_ - ta};
+    const int tb = last_split_;
+    if (tb >= last_t_ || ss2_ == nullptr) { err = "verify: the last window was not a batch window"; return false; }
+    const int len[2] = {tb, last_t_ - tb};
     for (int q = 0; q < 2; ++q)
-        if (n_keep[q] < 1 || n_keep[q] > len[q]) { err = "verify: commit count out of range"; return false; }
+        if (len[q] > 0 ? (n_keep[q] < 1 || n_keep[q] > len[q]) : n_keep[q] != 0) {
+            err = "verify: commit count out of range";
+            return false;
+        }
     const Clock::time_point t0 = Clock::now();
     int32_t* const hc[2] = {h_commit_, h_commit2_};
     for (int q = 0; q < 2; ++q) {
+        if (len[q] == 0) continue;
         hc[q][0] = n_keep[q];
         hc[q][1] = n_keep[q] - 1;
         for (int t = 0; t < max_t_; ++t) hc[q][2 + t] = t < n_keep[q] ? (int32_t) (last_pos0b_[q] + t) : -1;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    // the first sequence's rows start at 0 (its commit graph is the single-sequence one), the second's at ta
-    for (cudaGraphExec_t e : {commit_exec_, commit_b_exec_[ta]}) {
-        const cudaError_t le = cudaGraphLaunch(e, cs_);
+    // the first sequence's rows start at 0 (its commit graph is the single-sequence one), the second's at tb
+    for (int q = 0; q < 2; ++q) {
+        if (len[q] == 0) continue;
+        const cudaError_t le = cudaGraphLaunch(q == 0 ? commit_exec_ : commit_b_exec_[tb], cs_);
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     }
     const cudaError_t se = cudaStreamSynchronize(cs_);
@@ -1547,7 +1549,7 @@ bool Verifier::commit_batch(const int n_keep[2], std::string& err) {
     if (ple_stage())   // stages that share one session must advance it once
         for (int q = 0; q < 2; ++q) {
             SessionState& S = q == 0 ? *ss_ : *ss2_;
-            const int base = q == 0 ? 0 : ta;
+            const int base = q == 0 ? 0 : tb;
             for (int t = 0; t < n_keep[q]; ++t) {
                 S.ple_prev[0] = S.ple_prev[1];
                 S.ple_prev[1] = last_tokens_[base + t];
