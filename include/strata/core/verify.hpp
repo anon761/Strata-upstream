@@ -119,6 +119,19 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+
+    // ---- Batch-2 (docs/BATCH2.md): two independent sequences in one window ----
+    /// This stage's session for the SECOND sequence: the same layer range and K/V options as the first (the one
+    /// `init` got), its own state.  Null switches batch windows off.  Before the first `run_batch`.
+    bool set_batch_session(SessionState* second, std::string& err);
+    /// One window over two sequences: tokens [0, ta) continue sequence 0 at pos0[0], tokens [ta, T) sequence 1 at
+    /// pos0[1].  The dense projections, the router and the experts run once over all T tokens; the mixer's state
+    /// (GDN recurrence, QSA K/V and indexer, PLE history) is each sequence's own.  `out[t]` = the head's greedy pick
+    /// after token t - per-sequence sampling and penalties are not wired yet (refused).
+    bool run_batch(int T, int ta, const int32_t* tokens, const int64_t pos0[2], PoolMultiFn pool, void* user,
+                   int32_t* out, std::string& err);
+    /// Keeps the first n_keep[s] (1..its segment) tokens of each sequence of the last batch window.
+    bool commit_batch(const int n_keep[2], std::string& err);
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
@@ -161,7 +174,16 @@ public:
     std::string profile_report();
 
 private:
+    /// What one window covers: T tokens, and with ta > 0 two sequences (tokens [0, ta) and [ta, T)).
+    struct WindowArgs {
+        int T = 0;
+        int ta = 0;                  ///< 0: one sequence (`run`); else the second sequence's first token
+        const int32_t* tokens = nullptr;
+        int64_t pos0[2] = {0, 0};   ///< each sequence's first position
+    };
+    bool run_window(const WindowArgs& a, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     bool capture(int T, std::string& err);
+    bool capture_window(int T, int ta, cudaGraphExec_t* slot, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -183,6 +205,10 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
+    /// The commit graph of one sequence: its session, the window row its tokens start at, its indexer-tail
+    /// snapshot and its commit array (device copy + mapped staging).
+    bool record_commit(SessionState& S, int base, float* tail_snap, int32_t* commit_dev, const int32_t* commit_mapped,
+                       cudaGraphExec_t* slot, std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
@@ -205,6 +231,17 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
+    // Batch-2: the second sequence's session, the split the window being recorded uses, the batch windows'
+    // graphs per [ta][T], the second sequence's commit graph per ta, and its own commit array and tail snapshot
+    SessionState* ss2_ = nullptr;
+    int rec_ta_ = 0;
+    cudaGraphExec_t exec_b_[9][9] = {};
+    cudaGraphExec_t commit_b_exec_[9] = {};
+    int32_t* h_commit2_ = nullptr; int32_t* m_commit2_ = nullptr;
+    int32_t* commit2_ = nullptr;
+    float* tail_snap2_ = nullptr;
+    int last_ta_ = 0;
+    int64_t last_pos0b_[2] = {0, 0};
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

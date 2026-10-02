@@ -4215,6 +4215,102 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // ---- Batch-2 self-test (docs/BATCH2.md, branch batch2).  STRATA_BATCH2_SELFTEST=<steps>: two sequences
+        // decoded greedily from empty sessions, first each alone (one-token windows on the first session), then
+        // both together in two-token batch windows (the second on its own session); the picks must agree and the
+        // head's logits must be bitwise equal.  Prints PASS/FAIL and ends the process.
+        if (const char* bt = std::getenv("STRATA_BATCH2_SELFTEST"); bt != nullptr) {
+            const int steps = std::max(1, std::atoi(bt));
+            const int64_t cells = std::min<int64_t>(o.max_context, 4096);
+            const int32_t tok0[2] = {9707, 785};   // any two ids: the test compares the engine with itself
+            strata::core::SessionState ss2;
+            std::vector<strata::core::SessionState> st_ss2(stages.size());
+            {
+                const strata::core::OnDevice on0(0);
+                const int64_t hi0 = multi_gpu ? split_at[0] : -1;
+                void* b2 = nullptr;
+                if (cudaMalloc(&b2, strata::core::session_bytes(g, cells, K, 0, hi0)) != cudaSuccess ||
+                    strata::core::session_init(g, cells, K, b2, ss2, 0, hi0) == 0) {
+                    std::fprintf(stderr, "strata batch2: the second session failed\n");
+                    return 1;
+                }
+                ss2.ple = ss.ple;   // the table, weights and scratch are shared; the history and the n-gram are its own
+                ss2.ple.hist = ss2.ple_hist;
+                ss2.ple.token = &ss2.ple_token;
+                ss2.ple.prev = ss2.ple_prev;
+            }
+            for (size_t i = 0; i < stages.size(); ++i) {
+                const strata::core::OnDevice on(stages[i]->dev);
+                void* b2 = nullptr;
+                if (cudaMalloc(&b2, strata::core::session_bytes(g, cells, K, stages[i]->lb, stages[i]->le)) != cudaSuccess ||
+                    strata::core::session_init(g, cells, K, b2, st_ss2[i], stages[i]->lb, stages[i]->le) == 0) {
+                    std::fprintf(stderr, "strata batch2: the second session of CUDA%d failed\n", stages[i]->dev);
+                    return 1;
+                }
+            }
+            for (int st = 0; st < n_stages; ++st) {
+                strata::core::SessionState* second = st == 0 || split_same ? &ss2 : &st_ss2[(size_t) st - 1];
+                if (!stage_ver(st).set_batch_session(second, err)) {
+                    std::fprintf(stderr, "strata batch2: stage %d: %s\n", st + 1, err.c_str());
+                    return 1;
+                }
+            }
+            auto zero_all = [&] {
+                strata::core::session_zero(ss, g, nullptr, main_cs);
+                strata::core::session_zero(ss2, g, nullptr, main_cs);
+                cudaStreamSynchronize(main_stream);
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    const strata::core::OnDevice on(stages[i]->dev);
+                    strata::core::session_zero(stages[i]->ss, g, nullptr, (void*) stages[i]->stream);
+                    strata::core::session_zero(st_ss2[i], g, nullptr, (void*) stages[i]->stream);
+                    cudaStreamSynchronize(stages[i]->stream);
+                }
+            };
+            const int64_t V = ver.vocab();
+            std::vector<int32_t> pick[2];
+            std::vector<float> logit[2];
+            for (int q = 0; q < 2; ++q) {   // each sequence alone, on the first session
+                zero_all();
+                logit[q].resize((size_t) steps * (size_t) V);
+                int32_t tok = tok0[q];
+                for (int i = 0; i < steps; ++i) {
+                    int32_t out = -1;
+                    if (!ver.run(1, &tok, i, win_pool_fn, win_pool_user, &out, err) || !ver.commit(1, err) ||
+                        !ver.wait_commit(err) || !ver.copy_logits(0, logit[q].data() + (size_t) i * V)) {
+                        std::fprintf(stderr, "strata batch2: sequence %d alone, step %d: %s\n", q, i, err.c_str());
+                        return 1;
+                    }
+                    pick[q].push_back(out);
+                    tok = out;
+                }
+            }
+            zero_all();
+            int32_t toks[2] = {tok0[0], tok0[1]};
+            int bad_picks = 0, bad_logits = 0;
+            std::vector<float> row((size_t) V);
+            for (int i = 0; i < steps; ++i) {
+                const int64_t p[2] = {i, i};
+                const int keep[2] = {1, 1};
+                int32_t out[2] = {-1, -1};
+                if (!ver.run_batch(2, 1, toks, p, win_pool_fn, win_pool_user, out, err) || !ver.commit_batch(keep, err)) {
+                    std::fprintf(stderr, "strata batch2: batch step %d: %s\n", i, err.c_str());
+                    return 1;
+                }
+                for (int q = 0; q < 2; ++q) {
+                    bad_picks += out[q] != pick[q][(size_t) i];
+                    if (!ver.copy_logits(q, row.data())) {
+                        std::fprintf(stderr, "strata batch2: the batch logits could not be read\n");
+                        return 1;
+                    }
+                    bad_logits += std::memcmp(row.data(), logit[q].data() + (size_t) i * V, (size_t) V * 4) != 0;
+                    toks[q] = out[q];
+                }
+            }
+            std::fprintf(stderr, "strata batch2: %d steps x 2 sequences: %d picks and %d logit rows differ from the "
+                                 "sequences alone - %s\n", steps, bad_picks, bad_logits,
+                         bad_picks == 0 && bad_logits == 0 ? "PASS" : "FAIL");
+            return bad_picks == 0 && bad_logits == 0 ? 0 : 1;
+        }
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
         // it has consumed, so a request that starts with exactly them continues without any copy.  `checks` are the
