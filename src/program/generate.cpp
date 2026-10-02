@@ -4269,14 +4269,18 @@ int main(int argc, char** argv) {
             const int64_t V = ver.vocab();
             std::vector<int32_t> pick[2];
             std::vector<float> logit[2];
+            double ms_alone = 0.0, ms_batch = 0.0;   // wall time of the windows and commits (no logit reads)
             for (int q = 0; q < 2; ++q) {   // each sequence alone, on the first session
                 zero_all();
                 logit[q].resize((size_t) steps * (size_t) V);
                 int32_t tok = tok0[q];
                 for (int i = 0; i < steps; ++i) {
                     int32_t out = -1;
-                    if (!ver.run(1, &tok, i, win_pool_fn, win_pool_user, &out, err) || !ver.commit(1, err) ||
-                        !ver.wait_commit(err) || !ver.copy_logits(0, logit[q].data() + (size_t) i * V)) {
+                    const auto w0 = std::chrono::steady_clock::now();
+                    const bool ran = ver.run(1, &tok, i, win_pool_fn, win_pool_user, &out, err) && ver.commit(1, err) &&
+                                     ver.wait_commit(err);
+                    ms_alone += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                    if (!ran || !ver.copy_logits(0, logit[q].data() + (size_t) i * V)) {
                         std::fprintf(stderr, "strata batch2: sequence %d alone, step %d: %s\n", q, i, err.c_str());
                         return 1;
                     }
@@ -4312,8 +4316,11 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < nb; ++t) tk[na + t] = input[1][(size_t) (done[1] + t)];
                 const int64_t p[2] = {done[0], done[1]};
                 const int keep[2] = {na, nb};
-                if (!ver.run_batch(na + nb, na, tk, p, win_pool_fn, win_pool_user, out, err) ||
-                    !ver.commit_batch(keep, err)) {
+                const auto w0 = std::chrono::steady_clock::now();
+                const bool ran = ver.run_batch(na + nb, na, tk, p, win_pool_fn, win_pool_user, out, err) &&
+                                 ver.commit_batch(keep, err);
+                ms_batch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+                if (!ran) {
                     std::fprintf(stderr, "strata batch2: batch window %d: %s\n", windows, err.c_str());
                     return 1;
                 }
@@ -4334,6 +4341,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata batch2: %d steps x 2 sequences in %d windows of %d+%d: %d picks and %d logit "
                                  "rows differ from the sequences alone - %s\n", steps, windows, na, nb, bad_picks,
                          bad_logits, bad_picks == 0 && bad_logits == 0 ? "PASS" : "FAIL");
+            std::fprintf(stderr, "strata batch2: alone %.1f tok/s (one-token windows, %d tokens), batched %.1f tok/s "
+                                 "(%d tokens in %d windows)\n", 2.0 * steps * 1000.0 / ms_alone, 2 * steps,
+                         (double) (done[0] + done[1]) * 1000.0 / ms_batch, done[0] + done[1], windows);
             return bad_picks == 0 && bad_logits == 0 ? 0 : 1;
         }
         std::vector<int64_t> cur;
