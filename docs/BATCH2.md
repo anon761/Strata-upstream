@@ -109,3 +109,20 @@ the engine behaves as today).
 
 Sub-steps: M3a per-segment sampling in the verifier (+ parity test, sampled); M3b engine scheduler and protocol
 (+ engine test with two piped requests); M3c server.py; M3d rollout behind the flag, measurement with parallel agents.
+
+## M3 status (2026-10-02)
+
+Built and tested on prod (2x RTX 3090, the prod arguments plus `--batch2-cells 65536 --adapt-swaps 0`):
+
+- M3a: per-sequence sampling and penalty history in batch windows - the lock-step decode test, sampled at T=0.8 with a
+  repetition penalty, gives the same 300 tokens per sequence as each alone.
+- M3b: the serve scheduler as planned, with one simplification: the guest moves X -> Y once (154 ms at ~50 tokens) and
+  stays in slot Y until it ends - alone in second-sequence windows (`run_batch` with ta = 0) while X has no request.
+  Slot Y: 1051 MiB of sessions + 90 MiB for the twin drafter (~3.7% fewer expert-cache slots).
+  `.b2drive.py`: two chat requests serially vs. the second sent while the first decodes - identical outputs, greedy and
+  sampled+penalty; `STOP <id>` ends the guest only.
+- M3c: server.py admits two requests at once to an engine that says `READY ... batch2` (tagged lines demultiplexed per
+  request, STOP N, the DONE per thread); 138 tests pass.
+- Maya: `batch2_cells` in the Strata instance config (strata-run.py -> `--batch2-cells`), off by default.
+
+Open: M4, the measurement with real parallel agents on the prod engine.
