@@ -1500,7 +1500,7 @@ bool Verifier::set_batch_session(SessionState* second, std::string& err) {
         return false;
     }
     if (h_commit2_ == nullptr) {
-        const QsaShapes s = shapes_of(g);
+        const strata::kernels::QsaShapes s = shapes_of(g);
         const size_t tail = (size_t) g.n_qsa_layers() * (size_t) (s.idx_block - 1) * (size_t) g.idx_key_dim;
         if (!mapped((size_t) (2 + max_t_) * 4 + 16, (void**) &h_commit2_, (void**) &m_commit2_) ||
             cudaMalloc((void**) &commit2_, (size_t) (2 + max_t_) * 4) != cudaSuccess ||
