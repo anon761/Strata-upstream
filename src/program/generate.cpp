@@ -4266,6 +4266,139 @@ int main(int argc, char** argv) {
                     cudaStreamSynchronize(stages[i]->stream);
                 }
             };
+            // ---- M2: STRATA_BATCH2_DECODE=<tokens> decodes the two sequences with MTP drafts, greedily - first each
+            // alone (today's loop: a window of the last token and its drafts, the accepted prefix committed), then both
+            // in lock-step in batch windows [x0 drafts0 | x1 drafts1], the second drafting with a twin drafter.  The
+            // outputs must be the same token for token; prints both throughputs.
+            if (const char* dn = std::getenv("STRATA_BATCH2_DECODE"); dn != nullptr) {
+                const int max_new = std::max(1, std::atoi(dn));
+                if (o.mtp.empty()) { std::fprintf(stderr, "strata batch2: the decode test needs --mtp\n"); return 1; }
+                const int Sq = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;   // one sequence's window
+                if (2 * Sq > ver.max_window()) {
+                    std::fprintf(stderr, "strata batch2: two windows of %d do not fit the verifier's %d (raise --spec)\n",
+                                 Sq, ver.max_window());
+                    return 1;
+                }
+                strata::core::SessionState& last_ss2 =
+                    n_stages == 1 || split_same ? ss2 : st_ss2[(size_t) n_stages - 2];
+                strata::core::MtpDrafter twin;
+                {
+                    const strata::core::OnDevice on(mtp.device());
+                    if (!twin.load_twin(mtp, last_ss2, err)) {
+                        std::fprintf(stderr, "strata batch2: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+                mtp.set_max_drafts(Sq - 1);
+                twin.set_max_drafts(Sq - 1);
+                strata::kernels::SamplerParams greedy;
+                greedy.greedy = true;
+                ver.set_sampling(greedy);
+                ver.set_history(nullptr, 0);
+                strata::core::MtpDrafter* const drafter[2] = {&mtp, &twin};
+                auto zero_drafters = [&] {
+                    const strata::core::OnDevice on(mtp.device());
+                    for (strata::core::MtpDrafter* d : drafter) strata::core::qsa_state_zero(d->kv_state(), g, nullptr);
+                    cudaDeviceSynchronize();
+                };
+                const size_t hcn = (size_t) g.hc * (size_t) g.n_embd;
+                using DClock = std::chrono::steady_clock;
+                auto ms_of = [](DClock::time_point a0) {
+                    return std::chrono::duration<double, std::milli>(DClock::now() - a0).count();
+                };
+                // each alone, on the first session and the first drafter
+                std::vector<int32_t> alone[2];
+                double ms_serial = 0.0;
+                int64_t win_serial = 0, acc_serial = 0;
+                for (int q = 0; q < 2; ++q) {
+                    zero_all();
+                    zero_drafters();
+                    std::vector<int32_t> window((size_t) Sq), outv((size_t) Sq), drafts((size_t) Sq, 0);
+                    int64_t p = 0;
+                    int32_t x = tok0[q];
+                    int T = 1;
+                    const auto t0 = DClock::now();
+                    while ((int) alone[q].size() < max_new) {
+                        window[0] = x;
+                        for (int i = 1; i < T; ++i) window[(size_t) i] = drafts[(size_t) i - 1];
+                        if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err)) {
+                            std::fprintf(stderr, "strata batch2: alone %d: %s\n", q, err.c_str());
+                            return 1;
+                        }
+                        int a = 0;
+                        while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                        if (!ver.commit(a + 1, err) || !mtp.draft(T, outv.data(), p, a, drafts.data(), err)) {
+                            std::fprintf(stderr, "strata batch2: alone %d: %s\n", q, err.c_str());
+                            return 1;
+                        }
+                        alone[q].insert(alone[q].end(), outv.begin(), outv.begin() + a + 1);
+                        ++win_serial;
+                        acc_serial += a;
+                        x = outv[(size_t) a];
+                        p += a + 1;
+                        T = Sq;
+                    }
+                    if (!ver.wait_commit(err)) { std::fprintf(stderr, "strata batch2: %s\n", err.c_str()); return 1; }
+                    ms_serial += ms_of(t0);
+                }
+                // both in lock-step
+                zero_all();
+                zero_drafters();
+                std::vector<int32_t> both[2];
+                std::vector<int32_t> drafts[2] = {std::vector<int32_t>((size_t) Sq, 0), std::vector<int32_t>((size_t) Sq, 0)};
+                std::vector<int32_t> window((size_t) 2 * Sq), outv((size_t) 2 * Sq);
+                int64_t p[2] = {0, 0};
+                int32_t x[2] = {tok0[0], tok0[1]};
+                int T[2] = {1, 1};
+                int64_t win_batch = 0, acc_batch = 0;
+                const auto t0 = DClock::now();
+                while ((int) both[0].size() < max_new || (int) both[1].size() < max_new) {
+                    const int ta = T[0];
+                    window[0] = x[0];
+                    for (int i = 1; i < T[0]; ++i) window[(size_t) i] = drafts[0][(size_t) i - 1];
+                    window[(size_t) ta] = x[1];
+                    for (int i = 1; i < T[1]; ++i) window[(size_t) (ta + i)] = drafts[1][(size_t) i - 1];
+                    if (!ver.run_batch(T[0] + T[1], ta, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err)) {
+                        std::fprintf(stderr, "strata batch2: batch window %lld: %s\n", (long long) win_batch, err.c_str());
+                        return 1;
+                    }
+                    int a[2] = {0, 0};
+                    for (int q = 0; q < 2; ++q) {
+                        const int b = q == 0 ? 0 : ta;
+                        while (a[q] < T[q] - 1 && window[(size_t) (b + a[q] + 1)] == outv[(size_t) (b + a[q])]) ++a[q];
+                    }
+                    const int keep[2] = {a[0] + 1, a[1] + 1};
+                    if (!ver.commit_batch(keep, err) ||
+                        !mtp.draft(T[0], outv.data(), p[0], a[0], drafts[0].data(), err) ||
+                        !twin.stage_rows(ver.final_R_all() + (size_t) ta * hcn, T[1], err) ||
+                        !twin.draft(T[1], outv.data() + ta, p[1], a[1], drafts[1].data(), err)) {
+                        std::fprintf(stderr, "strata batch2: batch window %lld: %s\n", (long long) win_batch, err.c_str());
+                        return 1;
+                    }
+                    ++win_batch;
+                    for (int q = 0; q < 2; ++q) {
+                        const int b = q == 0 ? 0 : ta;
+                        both[q].insert(both[q].end(), outv.begin() + b, outv.begin() + b + a[q] + 1);
+                        acc_batch += a[q];
+                        x[q] = outv[(size_t) (b + a[q])];
+                        p[q] += a[q] + 1;
+                        T[q] = Sq;
+                    }
+                }
+                const double ms_batch2 = ms_of(t0);
+                int differ = 0;
+                for (int q = 0; q < 2; ++q)
+                    for (int i = 0; i < max_new; ++i) differ += both[q][(size_t) i] != alone[q][(size_t) i];
+                const int64_t made = (int64_t) both[0].size() + (int64_t) both[1].size();
+                std::fprintf(stderr, "strata batch2 decode: %d tokens x 2 sequences, windows of %d per sequence: %d tokens "
+                                     "differ from the sequences alone - %s\n", max_new, Sq, differ, differ == 0 ? "PASS" : "FAIL");
+                std::fprintf(stderr, "strata batch2 decode: alone %.1f tok/s (%lld windows, %.2f drafts kept per window), "
+                                     "lock-step %.1f tok/s for both (%lld windows, %.2f drafts kept per sequence and window)\n",
+                             (double) (alone[0].size() + alone[1].size()) * 1000.0 / ms_serial, (long long) win_serial,
+                             (double) acc_serial / (double) win_serial, (double) made * 1000.0 / ms_batch2,
+                             (long long) win_batch, (double) acc_batch / (2.0 * (double) win_batch));
+                return differ == 0 ? 0 : 1;
+            }
             const int64_t V = ver.vocab();
             std::vector<int32_t> pick[2];
             std::vector<float> logit[2];

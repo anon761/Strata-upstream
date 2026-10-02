@@ -115,13 +115,16 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
     if (cs_) cudaStreamDestroy(cs_);
-    if (dense_) cudaFree(dense_);
-    if (experts_) cudaFree(experts_);
+    if (!twin_) {   // a twin's weights and draft head are its base's
+        if (dense_) cudaFree(dense_);
+        if (experts_) cudaFree(experts_);
+        if (dhead_) cudaFree(dhead_);
+        if (dvocab_) cudaFree(dvocab_);
+    }
+    if (own_R_) cudaFree(own_R_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
-    if (dhead_) cudaFree(dhead_);
-    if (dvocab_) cudaFree(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
@@ -202,7 +205,24 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
+    window_arg_ = window;
+    if (!alloc_runtime(err)) return false;
+    const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
+    std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+                 (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+                 (double) tensors_.back().off / 1048576.0, files_s,
+                 files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
+                                   1048576.0 / files_s : 0.0);
+    return true;
+}
 
+// The layer's own K/V for the session `ss_`, the round buffers and the stream: what one sequence needs besides the
+// weights (load_twin gives a second sequence its own over the same weights).
+bool MtpDrafter::alloc_runtime(std::string& err) {
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int max_t = max_t_;
+    const int64_t window = window_arg_;
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
     const int64_t max_cells = ss.qsa_states[ss.qsa_primary()].max_cells;
@@ -292,12 +312,55 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
-    const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
-    std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                 (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
-                 (double) tensors_.back().off / 1048576.0, files_s,
-                 files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
-                                   1048576.0 / files_s : 0.0);
+    return true;
+}
+
+bool MtpDrafter::load_twin(const MtpDrafter& base, SessionState& ss, std::string& err) {
+    if (base.dense_ == nullptr || base.head_ == nullptr) { err = "mtp twin: the first drafter is not loaded and bound"; return false; }
+    if (coupled_draft_env()) { err = "mtp twin: coupled draft sampling (STRATA_SPEC_COUPLED) is not wired for batch-2"; return false; }
+    const OnDevice on_device(base.device_);
+    device_ = base.device_;
+    g_ = base.g_;
+    ss_ = &ss;
+    max_t_ = base.max_t_;
+    rt_dir_ = base.rt_dir_;
+    window_arg_ = base.window_arg_;
+    tensors_ = base.tensors_;
+    dense_ = base.dense_;
+    experts_ = base.experts_;
+    wt_ = base.wt_;
+    head_ = base.head_;
+    n_vocab_ = base.n_vocab_;
+    dhead_ = base.dhead_;
+    dvocab_ = base.dvocab_;
+    n_dvocab_ = base.n_dvocab_;
+    twin_ = true;
+    if (!alloc_runtime(err)) return false;
+    const uint64_t hcn = (uint64_t) g_->hc * (uint64_t) g_->n_embd;
+    float* rows = nullptr;
+    if (cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &rows, (size_t) max_t_ * hcn * sizeof(float)) != cudaSuccess) {
+        if (rows) cudaFree(rows);
+        err = "mtp twin: its logits and rows do not fit";
+        return false;
+    }
+    own_R_ = rows;
+    window_R_ = rows;
+    vram_ += (uint64_t) max_t_ * ((uint64_t) n_vocab_ * 4 + hcn * 4);
+    std::fprintf(stderr, "strata mtp: twin drafter for a second sequence, %.0f MiB of VRAM (weights shared)\n",
+                 (double) vram_ / 1048576.0);
+    return true;
+}
+
+bool MtpDrafter::stage_rows(const float* rows, int n, std::string& err) {
+    if (own_R_ == nullptr) { err = "mtp: stage_rows is for a twin"; return false; }
+    if (n < 1 || n > max_t_) { err = "mtp: stage_rows count out of range"; return false; }
+    const OnDevice on_device(device_);
+    const size_t hcn = (size_t) g_->hc * (size_t) g_->n_embd;
+    if (cudaMemcpy(own_R_, rows, (size_t) n * hcn * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) {
+        err = "mtp: staging the twin's rows failed";
+        return false;
+    }
     return true;
 }
 

@@ -44,6 +44,13 @@ public:
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
               int64_t window = 32768);
+    /// Batch-2 (docs/BATCH2.md): this drafter drafts for a second sequence over `base`'s weights and draft head
+    /// (`base` loaded and bound, and outliving this one): its own K/V for `ss` (that sequence's session on base's
+    /// device), round buffers, logits and stream.  Its window rows come from stage_rows, not from the verifier.
+    bool load_twin(const MtpDrafter& base, SessionState& ss, std::string& err);
+    /// A twin's window rows: `n` final residual rows (device, hc*n_embd each) - the second sequence's rows of a
+    /// batch window - before its draft().
+    bool stage_rows(const float* rows, int n, std::string& err);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -101,6 +108,7 @@ public:
     }
 
 private:
+    bool alloc_runtime(std::string& err);
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
@@ -159,6 +167,9 @@ private:
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
+    int64_t window_arg_ = 0;    // the window `load` was given (a twin's K/V follows it)
+    bool twin_ = false;         // load_twin: dense_, experts_, dhead_, dvocab_ belong to the base drafter
+    float* own_R_ = nullptr;    // a twin's window rows (stage_rows)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;
     // device
