@@ -140,6 +140,9 @@ public:
     /// token t, each sequence's rows sampled with its own parameters (set_sampling / set_batch_sampling).
     bool run_batch(int T, int ta, const int32_t* tokens, const int64_t pos0[2], PoolMultiFn pool, void* user,
                    int32_t* out, std::string& err);
+    /// Captures every batch-window shape now - each sequence up to `cap` rows, and the second alone - with their
+    /// commit graphs, on every stage: ~10-12 MiB of VRAM each, taken at the start instead of under load.
+    bool prepare_batch(int cap, std::string& err);
     /// Keeps the first n_keep[s] (1..its segment; 0 for a sequence without rows) tokens of each sequence of the last
     /// batch window.
     bool commit_batch(const int n_keep[2], std::string& err);

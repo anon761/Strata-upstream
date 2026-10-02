@@ -2309,6 +2309,9 @@ int main(int argc, char** argv) {
     // those allocations are already made before a stage's cache is sized, so what has to be held back here is
     // the windows and - only on the stage that carries them - the drafter and the head.
     const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
+    // --batch2-cells: the batch windows' graphs, captured at the start (Verifier::prepare_batch): 20 shapes, 214 MiB
+    // measured on a stage, rounded up
+    const int64_t kBatch2GraphMib = o.batch2_cells > 0 ? 320 : 0;
     const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
     // #340: with the own prompt buffers chosen by the split's rule (not asked for with --no-prefill-borrow) the
     // boundary is searched as the borrowing configuration would (no reserve): the reserve then only makes the caches
@@ -2327,7 +2330,7 @@ int main(int argc, char** argv) {
                          cudaGetErrorString(e));
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         const int64_t reserve = ((int64_t) o.vram_reserve_mib + pf + (later ? kWindowMib : 0) +
-                                 (drafter ? kDrafterMib : 0)) << 20;
+                                 (drafter ? kDrafterMib : 0) + kBatch2GraphMib) << 20;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -2735,7 +2738,7 @@ int main(int argc, char** argv) {
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) +
                                            (o.batch2_cells > 0 ? (int64_t) twin.bind_twin_bytes(n_vocab) : 0)
                                      : 0;
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib + kBatch2GraphMib) << 20) + mtp_bind;
         int64_t slots = ((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
@@ -2752,7 +2755,7 @@ int main(int argc, char** argv) {
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const int64_t prefill_mib = (o.prefill_chunk > 0 && !pf_borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib) << 20;
+        const int64_t reserve = ((int64_t) o.vram_reserve_mib + prefill_mib + kBatch2GraphMib) << 20;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
             std::fprintf(stderr, "strata generate: layer split: --expert-cache %d leaves no room for the prompt path's "
@@ -4274,6 +4277,15 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        if (o.batch2_cells > 0) {   // every batch shape now, in the room the expert caches left for it
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!ver.prepare_batch(ver.max_window() / 2, err)) {
+                std::fprintf(stderr, "strata serve: batch-2: capturing the batch windows: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: batch-2: every batch window captured in %.1f s\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
@@ -4486,38 +4498,6 @@ int main(int argc, char** argv) {
                              (double) acc_serial / (double) win_serial, (double) made * 1000.0 / ms_batch2,
                              (long long) win_batch, (double) acc_batch / (2.0 * (double) win_batch));
                 return differ == 0 ? 0 : 1;
-            }
-            // STRATA_BATCH2_GRAPHS=1: every batch-window shape the serve scheduler can use (each sequence up to half
-            // the verifier's width, and the second sequence alone), captured once; prints what they took per device
-            if (std::getenv("STRATA_BATCH2_GRAPHS") != nullptr) {
-                const int cap = ver.max_window() / 2;
-                std::vector<size_t> free0(stages.size() + 1);
-                auto free_of = [&](size_t i) {
-                    const strata::core::OnDevice on(i == 0 ? 0 : stages[i - 1]->dev);
-                    size_t f = 0, t = 0;
-                    cudaDeviceSynchronize();
-                    cudaMemGetInfo(&f, &t);
-                    return f;
-                };
-                for (size_t i = 0; i < free0.size(); ++i) free0[i] = free_of(i);
-                zero_all();
-                std::vector<int32_t> tk((size_t) ver.max_window(), tok0[0]), out((size_t) ver.max_window());
-                int shapes = 0;
-                for (int ta = 0; ta <= cap; ++ta)
-                    for (int tb = 1; tb <= cap; ++tb) {
-                        const int64_t p[2] = {0, 0};
-                        const int keep[2] = {ta, tb};
-                        if (!ver.run_batch(ta + tb, ta, tk.data(), p, win_pool_fn, win_pool_user, out.data(), err) ||
-                            !ver.commit_batch(keep, err)) {
-                            std::fprintf(stderr, "strata batch2: shape %d + %d: %s\n", ta, tb, err.c_str());
-                            return 1;
-                        }
-                        ++shapes;
-                    }
-                for (size_t i = 0; i < free0.size(); ++i)
-                    std::fprintf(stderr, "strata batch2 graphs: %d shapes, device part %zu: %.0f MiB\n", shapes, i,
-                                 (double) (free0[i] - free_of(i)) / 1048576.0);
-                return 0;
             }
             const int64_t V = ver.vocab();
             std::vector<int32_t> pick[2];

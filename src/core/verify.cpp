@@ -1524,6 +1524,21 @@ bool Verifier::set_batch_session(SessionState* second, std::string& err) {
     return true;
 }
 
+bool Verifier::prepare_batch(int cap, std::string& err) {
+    const OnDevice on_device(device_);
+    if (ss2_ == nullptr) { err = "verify: prepare_batch before set_batch_session"; return false; }
+    if (cap < 1 || 2 * cap > max_t_) { err = "verify: batch shapes wider than the window"; return false; }
+    if (!capture_commit(err)) return false;
+    for (int ta = 0; ta <= cap; ++ta) {
+        for (int tb = 1; tb <= cap; ++tb)
+            if (!capture_window(ta + tb, ta, &exec_b_[ta][ta + tb], err)) return false;
+        if (commit_b_exec_[ta] == nullptr &&
+            !record_commit(*ss2_, ta, tail_snap2_, commit2_, m_commit2_, &commit_b_exec_[ta], err))
+            return false;
+    }
+    return next_ == nullptr || next_->prepare_batch(cap, err);
+}
+
 bool Verifier::commit_batch(const int n_keep[2], std::string& err) {
     const OnDevice on_device(device_);
     const int tb = last_split_;
