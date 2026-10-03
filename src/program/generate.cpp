@@ -505,6 +505,9 @@ void usage() {
                  "                       larger than the budget is not parked.  Needs --prompt-cache > 0.\n"
                  "                       Example: --conversation-cache-mib 16384 (16 GiB)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --expert-support GU,D,N_EMBD,N_FF  print whether this engine has GPU kernels for experts of these\n"
+                 "                       ggml types (gate/up, down) and sizes - 'supported' (exit 0) or 'unsupported'\n"
+                 "                       (exit 3) - and exit; no GPU needed (tools/install uses it to check a GGUF)\n"
                  "  --batch2-cells N     --serve: decode two tagged requests (GEN ... id=N) together; the second\n"
                  "                       sequence's slot holds N cells (needs --mtp; docs/BATCH2.md)\n"
                  "  --conversation-cache-min-free-mib N  --serve: never park when it would leave less than N MiB of\n"
@@ -1018,6 +1021,19 @@ int main(int argc, char** argv) {
         };
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
+        else if (a == "--expert-support") {
+            // The same check the expert layout load runs below, without a pack or a GPU: the installer asks it
+            // for every (gate/up, down, size) combination of a GGUF before it prepares anything.
+            std::vector<int64_t> v;
+            std::string e;
+            if (!parse_i64_list(next("--expert-support"), v, e) || v.size() != 4) {
+                std::fprintf(stderr, "--expert-support wants GU,D,N_EMBD,N_FF (ggml type ids and sizes)\n");
+                return 2;
+            }
+            const bool ok = strata::kernels::native_expert_supported((int) v[0], (int) v[1], v[2], v[3]);
+            std::printf("%s\n", ok ? "supported" : "unsupported");
+            return ok ? 0 : 3;
+        }
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
