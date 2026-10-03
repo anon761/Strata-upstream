@@ -59,7 +59,40 @@ haystack recall 12/12 at 2K/32K/128K/250K.
 `--pcie-frac 0` (an expert-cache miss is computed by the CPU pool instead of fetched over PCIe) suits a CPU with
 many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep the default.
 
-## Building and running
+## Installing
+
+On a bare **Debian 12 or 13** (amd64) the installer sets up everything - system packages, the NVIDIA driver and
+CUDA toolkit 13.3 from NVIDIA's Debian repository, the Python environment, and the engine built from this fork for
+the GPUs it finds. No environment variables are needed.
+
+```bash
+git clone <this fork> && cd arcfork-strata
+sudo ./install.sh                                    # install; reboots once if it had to install the driver
+sudo ./install.sh --gguf /models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+```
+
+With `--gguf` it checks the model (architecture, every layer's expert types against the engine's GPU kernels, RAM
+for the expert arena), shows the settings it proposes for this hardware with a reason for each - GPUs and layer
+split, context length, the n-gram table in RAM, `--pcie-frac`, conversation parking, Batch-2 - and after you
+confirm builds the pack and the MTP draft head next to the model and writes `configs/<name>.json` and
+`run-<name>.sh`. Useful options:
+
+| Option | |
+| --- | --- |
+| `--check` | only show the hardware and the proposal (no root needed, changes nothing) |
+| `--set KEY=VALUE` | change a proposed setting, e.g. `--set max_context=131072` (repeatable) |
+| `--yes` | apply without asking |
+| `--service` | also install a systemd service `strata-<name>` that starts at boot |
+| `--port`, `--host`, `--name` | API port (8080), listen address (127.0.0.1), the model name the API reports |
+| `--mtp-repo URL` | the BF16 checkpoint with the MTP head of a fine-tune (default: Qwen's) |
+| `--cuda-arch 86,89` | build for these GPUs instead of the visible ones (a build container without GPUs) |
+
+In a container (LXC, Docker) the driver comes from the host: pass the GPUs in, the installer installs the rest.
+Running it again only does what is missing; a rebuilt engine follows a new checkout. Upstream's own one-click setup
+(`setup.sh` / `START-HERE.bat`) stays for upstream's GSQ-RCO models and ready-made engines, which lack this fork's
+changes.
+
+### By hand
 
 ```bash
 git clone <this fork> && cd arcfork-strata

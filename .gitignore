@@ -49,3 +49,9 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# created by install.sh on the user's machine (build-install/ and logs/ are covered above)
+/.install/
+/engine/
+/configs/
+/run-*.sh
