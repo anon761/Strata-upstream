@@ -249,8 +249,8 @@ def engine_config(model, settings: dict, pack: Path, mtp_rt: Path, served_name: 
     if settings["conversation_cache_mib"] > 0:
         args += ["--conversation-cache-mib", str(settings["conversation_cache_mib"]),
                  "--conversation-cache-slots", str(settings["conversation_cache_slots"])]
-    if settings["batch2_cells"] > 0:
-        args += ["--batch2-cells", str(settings["batch2_cells"])]
+    if settings.get("batch", 0) > 0:
+        args += ["--batch", str(settings["batch"])]
     if settings["kv_resident"] > 0:
         args += ["--kv-resident", str(settings["kv_resident"])]
     if settings["resident_budget_gib"] > 0:   # the mapped mode with a RAM budget: experts from the GGUF in place

@@ -150,13 +150,13 @@ class PlanTest(unittest.TestCase):
         s = p.settings
         self.assertEqual(p.problems, [])
         self.assertEqual((s["gpu"], s["layer_split"], s["max_context"]), ([0, 1], "auto", 262000))
-        self.assertEqual((s["ple_io"], s["pcie_frac"], s["batch2_cells"]), ("ram", 0, 65536))
+        self.assertEqual((s["ple_io"], s["pcie_frac"], s["batch"]), ("ram", 0, 2))
         self.assertEqual((s["conversation_cache_mib"], s["conversation_cache_slots"]), (65536, 20))
         self.assertEqual([r[0] for r in p.reasons], list(s))  # every setting has its reason
 
     def test_single_12gb_card_on_a_desktop(self):
         s = plan.propose(fake_model(), machine(gpus=1, vram=12288, ram=192, threads=16), []).settings
-        self.assertEqual((s["gpu"], s["layer_split"], s["batch2_cells"]), ([0], "", 0))
+        self.assertEqual((s["gpu"], s["layer_split"], s["batch"]), ([0], "", 0))
         self.assertEqual(s["pcie_frac"], "")
         self.assertEqual(s["ple_io"], "ram")        # 192 - 100 - 24 = 68 GiB left, the table takes 28
         # 40 GiB left: KV streaming puts the whole 262K KV cache (3.4 GiB) in RAM, so VRAM no longer bounds it
@@ -167,17 +167,17 @@ class PlanTest(unittest.TestCase):
         small = plan.propose(fake_model(ple_gib=1), machine(gpus=1, vram=11264, ram=126, threads=16), []).settings
         self.assertEqual(small["max_context"], 65536)  # 6 GiB free: 128K's 1.68 GiB is over a quarter
 
-    def test_batch2_keeps_the_kv_cache_in_vram(self):
+    def test_batch_keeps_the_kv_cache_in_vram(self):
         p = plan.propose(fake_model(), machine(), [])
-        self.assertEqual((p.settings["batch2_cells"], p.settings["kv_resident"]), (65536, 0))
-        self.assertIn("Batch-2", dict((k, w) for k, _, w in p.reasons)["kv_resident"])
+        self.assertEqual((p.settings["batch"], p.settings["kv_resident"]), (2, 0))
+        self.assertIn("batching", dict((k, w) for k, _, w in p.reasons)["kv_resident"])
 
     def test_experts_past_the_ram_take_the_budget_mode_on_one_card(self):
         p = plan.propose(fake_model(expert_gib=100), machine(ram=96), [])
         s = p.settings
         self.assertEqual(p.problems, [])
         self.assertEqual((s["resident_budget_gib"], s["gpu"], s["layer_split"]), (72, [0], ""))
-        self.assertEqual((s["batch2_cells"], s["conversation_cache_mib"], s["ple_io"]), (0, 0, ""))
+        self.assertEqual((s["batch"], s["conversation_cache_mib"], s["ple_io"]), (0, 0, ""))
         self.assertTrue(any("do not fit in RAM" in n for n in p.notes))
         self.assertTrue(any("RAM" in x for x in plan.propose(fake_model(), machine(ram=40), []).problems))
 
@@ -287,14 +287,14 @@ class CliTest(unittest.TestCase):
         args = cfg["args"]
         for flag, value in (("--native", "/m/M-00001-of-00002.gguf"), ("--native-head-gguf", "/m/h.gguf"),
                             ("--ple-gguf", "/m/p.gguf"), ("--mtp", "/m/strata-mtp/rt"), ("--max-context", "262000"),
-                            ("--pcie-frac", "0"), ("--ple-io", "ram"), ("--batch2-cells", "65536"),
+                            ("--pcie-frac", "0"), ("--ple-io", "ram"), ("--batch", "2"),
                             ("--conversation-cache-mib", "65536")):
             self.assertEqual(args[args.index(flag) + 1], value, flag)
         self.assertEqual((cfg["gpu"], cfg["layer_split"], cfg["host"]), ([0, 1], "auto", "127.0.0.1"))
         self.assertNotIn("env", cfg)
         s1 = plan.propose(m, machine(gpus=1, vram=12288, ram=130, threads=8), []).settings
         args1 = steps.engine_config(m, s1, Path("/p"), Path("/r"), "M", Path("/l"))["args"]
-        for flag in ("--pcie-frac", "--ple-io", "--batch2-cells", "--conversation-cache-mib", "--resident-budget-gib"):
+        for flag in ("--pcie-frac", "--ple-io", "--batch", "--conversation-cache-mib", "--resident-budget-gib"):
             self.assertNotIn(flag, args1)
         self.assertNotIn("api_key", cfg)
         self.assertNotIn("split_skip_if_fits", cfg)

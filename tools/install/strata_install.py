@@ -185,8 +185,8 @@ def show_reference(h, probe, a) -> None:
         parts.append("n-gram table in RAM" if st["ple_io"] == "ram" else "n-gram table on SSD")
         if st["conversation_cache_mib"]:
             parts.append(f"parking {st['conversation_cache_mib'] // 1024} GiB")
-        if st["batch2_cells"]:
-            parts.append("Batch-2")
+        if st["batch"]:
+            parts.append(f"batch x{st['batch']}")
         if st["split_skip_if_fits"]:
             parts.append("skip the split if the first card fits")
         steps.say(f"  {ref.name:<20} " + ", ".join(parts))
