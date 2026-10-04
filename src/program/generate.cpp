@@ -542,6 +542,14 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
+                 "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
+                 "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
+                 "                       so a caller never has to export environment variables\n"
+                 "  --expert-support GU,D,N_EMBD,N_FF  print whether this engine has GPU kernels for experts of these\n"
+                 "                       ggml types (gate/up, down) and sizes - 'supported' (exit 0) or 'unsupported'\n"
+                 "                       (exit 3) - and exit; no GPU needed (tools/install uses it to check a GGUF)\n"
+                 "  --system-probe       print every GPU's host->device GB/s, which GPU pairs have P2P, and RAM read\n"
+                 "                       GB/s over all threads (the installer's --system-check), then exit\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
                  "                       shard that holds per_layer_token_embd.weight when not given\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
@@ -1223,6 +1231,56 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// --system-probe: what the installer's system check measures - every visible GPU's host->device bandwidth, which
+// pairs of them can reach each other (P2P), and how fast all cores together read RAM (the CPU expert pool streams
+// expert weights out of RAM, so its share of the misses is bound by this).  One line per fact, machine-readable.
+int system_probe() {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); n = 0; }
+    for (int d = 0; d < n; ++d) {
+        if (cudaSetDevice(d) != cudaSuccess) { cudaGetLastError(); continue; }
+        std::printf("pcie %d %.1f\n", d, probe_pcie_h2d_gbps());
+    }
+    for (int a = 0; a < n; ++a)
+        for (int b = 0; b < n; ++b)
+            if (a != b) {
+                int ok = 0;
+                cudaDeviceCanAccessPeer(&ok, a, b);
+                std::printf("p2p %d %d %d\n", a, b, ok);
+            }
+    // RAM: 4 GiB (well past any cache), touched first, then read by every hardware thread at once; the best of
+    // three passes
+    constexpr size_t kBytes = 4ull << 30;
+    std::vector<uint64_t> buf(kBytes / 8);
+    const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t per = buf.size() / threads;
+    std::vector<uint64_t> sums(threads);
+    auto pass = [&](bool write) {
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < threads; ++t)
+            pool.emplace_back([&, t] {
+                uint64_t* p = buf.data() + t * per;
+                uint64_t acc = 0;
+                if (write) for (size_t i = 0; i < per; ++i) p[i] = i ^ t;
+                else for (size_t i = 0; i < per; i += 4) acc += p[i] + p[i + 1] + p[i + 2] + p[i + 3];
+                sums[t] = acc;
+            });
+        for (auto& th : pool) th.join();
+    };
+    pass(true);
+    double best = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        pass(false);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        best = std::max(best, (double) (per * threads * 8) / s / 1e9);
+    }
+    uint64_t keep = 0;
+    for (uint64_t v : sums) keep ^= v;
+    std::printf("ram_read %.1f %u %llu\n", best, threads, (unsigned long long) (keep & 1));
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1249,6 +1307,20 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+    // --gpu LIST pins the visible GPUs (nvidia-smi/PCI order) from the command line instead of the caller's
+    // environment: CUDA_VISIBLE_DEVICES is read at the first CUDA call, so this has to happen here, before
+    // anything else.  The value itself is consumed again by the option loop below.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) != "--gpu") continue;
+#if defined(_WIN32)
+        _putenv_s("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+        _putenv_s("CUDA_VISIBLE_DEVICES", argv[i + 1]);
+#else
+        setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+        setenv("CUDA_VISIBLE_DEVICES", argv[i + 1], 1);
+#endif
+        break;
+    }
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -1260,6 +1332,21 @@ int main(int argc, char** argv) {
         };
         bool parsed = true;
         if (a == "--help" || a == "-h") { usage(); return 0; }
+        else if (a == "--expert-support") {
+            // The same check the expert layout load runs below, without a pack or a GPU: the installer asks it
+            // for every (gate/up, down, size) combination of a GGUF before it prepares anything.
+            std::vector<int64_t> v;
+            std::string e;
+            if (!parse_i64_list(next("--expert-support"), v, e) || v.size() != 4) {
+                std::fprintf(stderr, "--expert-support wants GU,D,N_EMBD,N_FF (ggml type ids and sizes)\n");
+                return 2;
+            }
+            const bool ok = strata::kernels::native_expert_supported((int) v[0], (int) v[1], v[2], v[3]);
+            std::printf("%s\n", ok ? "supported" : "unsupported");
+            return ok ? 0 : 3;
+        }
+        else if (a == "--system-probe") return system_probe();
+        else if (a == "--gpu") { (void) next("--gpu"); }   // applied at startup, before any CUDA call
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }
