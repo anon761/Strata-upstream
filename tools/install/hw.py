@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import resource
 import shutil
 import subprocess
+from pathlib import Path
 
 
 @dataclasses.dataclass
@@ -19,6 +21,7 @@ class GPU:
     compute_cap: str  # "8.6"
     pcie_gen: int
     pcie_width: int
+    pcie_width_now: int = 0  # the link's current width; less than pcie_width: the card sits in a narrower slot
 
     @property
     def sm(self) -> int:
@@ -54,25 +57,73 @@ class Hardware:
     ram_gib: float
     cpu: CPU
     driver: str  # "" without a working NVIDIA driver
+    thp: str = ""            # transparent huge pages: always / madvise / never ("" unknown)
+    memlock_gib: float = -1  # this shell's locked-memory limit; -1 = unlimited
 
 
-NVIDIA_SMI_QUERY = "index,name,memory.total,compute_cap,pcie.link.gen.max,pcie.link.width.max,driver_version"
+@dataclasses.dataclass
+class Probe:
+    """What `strata --system-probe` measured."""
+    pcie_gbps: dict          # GPU index -> host->device GB/s (< 0: the probe failed)
+    p2p: set                 # (a, b): GPU a can read GPU b directly
+    ram_gbps: float          # all threads reading RAM at once
+    ram_threads: int
+
+
+NVIDIA_SMI_QUERY = ("index,name,memory.total,compute_cap,pcie.link.gen.max,pcie.link.width.max,driver_version,"
+                    "pcie.link.width.current")
 
 
 def parse_nvidia_smi(text: str) -> tuple[list, str]:
-    """nvidia-smi --query-gpu=<NVIDIA_SMI_QUERY> --format=csv,noheader,nounits -> (GPUs, driver version)."""
+    """nvidia-smi --query-gpu=<NVIDIA_SMI_QUERY> --format=csv,noheader,nounits -> (GPUs, driver version).
+    The current link width (the 8th field) is optional."""
     gpus, driver = [], ""
     for line in text.splitlines():
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 7:
+        if len(parts) not in (7, 8):
             continue
         try:
             gpus.append(GPU(index=int(parts[0]), name=parts[1], vram_mib=int(float(parts[2])),
-                            compute_cap=parts[3], pcie_gen=_int(parts[4]), pcie_width=_int(parts[5])))
+                            compute_cap=parts[3], pcie_gen=_int(parts[4]), pcie_width=_int(parts[5]),
+                            pcie_width_now=_int(parts[7]) if len(parts) == 8 else 0))
         except ValueError:
             continue
         driver = parts[6]
     return gpus, driver
+
+
+def parse_thp(text: str) -> str:
+    """/sys/kernel/mm/transparent_hugepage/enabled ("always [madvise] never") -> the selected mode."""
+    for word in text.split():
+        if word.startswith("[") and word.endswith("]"):
+            return word[1:-1]
+    return ""
+
+
+def parse_probe(text: str) -> Probe:
+    """`strata --system-probe` output -> Probe."""
+    pcie, p2p, ram, threads = {}, set(), 0.0, 0
+    for line in text.splitlines():
+        f = line.split()
+        try:
+            if f[:1] == ["pcie"] and len(f) == 3:
+                pcie[int(f[1])] = float(f[2])
+            elif f[:1] == ["p2p"] and len(f) == 4 and f[3] == "1":
+                p2p.add((int(f[1]), int(f[2])))
+            elif f[:1] == ["ram_read"] and len(f) >= 3:
+                ram, threads = float(f[1]), int(f[2])
+        except ValueError:
+            continue
+    return Probe(pcie_gbps=pcie, p2p=p2p, ram_gbps=ram, ram_threads=threads)
+
+
+def free_gib(path: Path) -> float:
+    """Free disk space where `path` (or its nearest existing parent) lives."""
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    st = os.statvfs(p)
+    return st.f_bavail * st.f_frsize / 1024 ** 3
 
 
 def _int(s: str) -> int:
@@ -126,7 +177,24 @@ def detect() -> Hardware:
         ram = parse_meminfo(f.read())
     with open("/proc/cpuinfo", encoding="utf-8") as f:
         cpu = parse_cpuinfo(f.read())
-    return Hardware(gpus=gpus, ram_gib=ram, cpu=cpu, driver=driver)
+    thp = ""
+    try:
+        with open("/sys/kernel/mm/transparent_hugepage/enabled", encoding="utf-8") as f:
+            thp = parse_thp(f.read())
+    except OSError:
+        pass
+    soft, _ = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    memlock = -1.0 if soft == resource.RLIM_INFINITY else soft / 1024 ** 3
+    return Hardware(gpus=gpus, ram_gib=ram, cpu=cpu, driver=driver, thp=thp, memlock_gib=memlock)
+
+
+def probe(engine: Path) -> Probe | None:
+    """Runs `strata --system-probe` (PCIe per GPU, P2P, RAM bandwidth; ~30 s, the GPUs should be idle)."""
+    try:
+        out = subprocess.run([str(engine), "--system-probe"], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_probe(out.stdout) if out.returncode == 0 else None
 
 
 def in_container() -> bool:

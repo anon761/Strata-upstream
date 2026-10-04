@@ -505,6 +505,8 @@ void usage() {
                  "                       larger than the budget is not parked.  Needs --prompt-cache > 0.\n"
                  "                       Example: --conversation-cache-mib 16384 (16 GiB)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --system-probe       print every GPU's host->device GB/s, which GPU pairs have P2P, and RAM read\n"
+                 "                       GB/s over all threads (the installer's --system-check), then exit\n"
                  "  --expert-support GU,D,N_EMBD,N_FF  print whether this engine has GPU kernels for experts of these\n"
                  "                       ggml types (gate/up, down) and sizes - 'supported' (exit 0) or 'unsupported'\n"
                  "                       (exit 3) - and exit; no GPU needed (tools/install uses it to check a GGUF)\n"
@@ -993,6 +995,56 @@ double probe_pcie_h2d_gbps() {
     return bw;
 }
 
+// --system-probe: what the installer's system check measures - every visible GPU's host->device bandwidth, which
+// pairs of them can reach each other (P2P), and how fast all cores together read RAM (the CPU expert pool streams
+// expert weights out of RAM, so its share of the misses is bound by this).  One line per fact, machine-readable.
+int system_probe() {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) { cudaGetLastError(); n = 0; }
+    for (int d = 0; d < n; ++d) {
+        if (cudaSetDevice(d) != cudaSuccess) { cudaGetLastError(); continue; }
+        std::printf("pcie %d %.1f\n", d, probe_pcie_h2d_gbps());
+    }
+    for (int a = 0; a < n; ++a)
+        for (int b = 0; b < n; ++b)
+            if (a != b) {
+                int ok = 0;
+                cudaDeviceCanAccessPeer(&ok, a, b);
+                std::printf("p2p %d %d %d\n", a, b, ok);
+            }
+    // RAM: 4 GiB (well past any cache), touched first, then read by every hardware thread at once; the best of
+    // three passes
+    constexpr size_t kBytes = 4ull << 30;
+    std::vector<uint64_t> buf(kBytes / 8);
+    const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
+    const size_t per = buf.size() / threads;
+    std::vector<uint64_t> sums(threads);
+    auto pass = [&](bool write) {
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < threads; ++t)
+            pool.emplace_back([&, t] {
+                uint64_t* p = buf.data() + t * per;
+                uint64_t acc = 0;
+                if (write) for (size_t i = 0; i < per; ++i) p[i] = i ^ t;
+                else for (size_t i = 0; i < per; i += 4) acc += p[i] + p[i + 1] + p[i + 2] + p[i + 3];
+                sums[t] = acc;
+            });
+        for (auto& th : pool) th.join();
+    };
+    pass(true);
+    double best = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        pass(false);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        best = std::max(best, (double) (per * threads * 8) / s / 1e9);
+    }
+    uint64_t keep = 0;
+    for (uint64_t v : sums) keep ^= v;
+    std::printf("ram_read %.1f %u %llu\n", best, threads, (unsigned long long) (keep & 1));
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1034,6 +1086,7 @@ int main(int argc, char** argv) {
             std::printf("%s\n", ok ? "supported" : "unsupported");
             return ok ? 0 : 3;
         }
+        else if (a == "--system-probe") return system_probe();
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
             if (have_tokens) { std::fprintf(stderr, "supply one token input only\n"); return 2; }

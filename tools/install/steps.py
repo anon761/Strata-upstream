@@ -11,7 +11,6 @@ import hashlib
 import os
 import shutil
 import subprocess
-import sys
 import urllib.request
 from pathlib import Path
 
@@ -252,6 +251,10 @@ def engine_config(model, settings: dict, pack: Path, mtp_rt: Path, served_name: 
                  "--conversation-cache-slots", str(settings["conversation_cache_slots"])]
     if settings["batch2_cells"] > 0:
         args += ["--batch2-cells", str(settings["batch2_cells"])]
+    if settings["kv_resident"] > 0:
+        args += ["--kv-resident", str(settings["kv_resident"])]
+    if settings["resident_budget_gib"] > 0:   # the mapped mode with a RAM budget: experts from the GGUF in place
+        args += ["--resident-budget-gib", str(settings["resident_budget_gib"])]
     cfg = {
         "exe": str(ENGINE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
         "model_name": served_name, "log": str(log), "lib_dirs": cuda_lib_dirs(),
@@ -259,6 +262,10 @@ def engine_config(model, settings: dict, pack: Path, mtp_rt: Path, served_name: 
     }
     if settings["layer_split"]:
         cfg["layer_split"] = settings["layer_split"]
+    if settings["split_skip_if_fits"]:
+        cfg["split_skip_if_fits"] = True
+    if settings["api_key"]:
+        cfg["api_key"] = str(settings["api_key"])
     return cfg
 
 

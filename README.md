@@ -75,11 +75,22 @@ With `--gguf` it checks the model (architecture, every layer's expert types agai
 for the expert arena), shows the settings it proposes for this hardware with a reason for each - GPUs and layer
 split, context length, the n-gram table in RAM, `--pcie-frac`, conversation parking, Batch-2 - and after you
 confirm builds the pack and the MTP draft head next to the model and writes `configs/<name>.json` and
-`run-<name>.sh`. Useful options:
+`run-<name>.sh`. Features that only work once switched on are proposed where they fit: KV streaming
+(`--kv-resident`, from 64K context when RAM holds the KV cache; not with Batch-2), the RAM-budget mode
+(`--resident-budget-gib`, one GPU) when the experts do not fit in RAM instead of refusing the model, skipping the
+split when the first card holds every expert, and an API key once `--host` is not local. It also notes what the
+system has to allow: transparent huge pages off, a memlock limit below the experts, a GPU in a narrower slot.
+
+`./install.sh --system-check` (no root, changes nothing) checks this machine - driver, transparent huge pages,
+memlock, free disk, GPUs and their links, CPU, RAM - offers to measure every GPU's PCIe bandwidth, P2P and the RAM's
+read bandwidth (y/n; stop a running engine first, it holds the GPUs' memory) and prints the best settings: for one
+model with `--gguf`, else for the common quantizations (UD-Q4_K_XL, Swift-1.5 Q4_K_L, Q5_K_M, UD-Q6_K_XL). The
+measurement decides `--pcie-frac`; the engine's `--system-probe` does it. Useful options:
 
 | Option | |
 | --- | --- |
 | `--check` | only show the hardware and the proposal (no root needed, changes nothing) |
+| `--system-check` | check this machine and print its best settings (with `--gguf`: for that model); `--yes` measures without asking |
 | `--set KEY=VALUE` | change a proposed setting, e.g. `--set max_context=131072` (repeatable) |
 | `--yes` | apply without asking |
 | `--service` | also install a systemd service `strata-<name>` that starts at boot |

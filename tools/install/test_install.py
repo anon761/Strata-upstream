@@ -118,6 +118,17 @@ class HardwareTest(unittest.TestCase):
         self.assertFalse(hw.parse_cpuinfo("processor : 0\nflags : sse4_2\n").avx2_ok)
 
 
+class SystemFactsTest(unittest.TestCase):
+    def test_thp_probe_and_current_link_width(self):
+        self.assertEqual(hw.parse_thp("always [madvise] never\n"), "madvise")
+        self.assertEqual(hw.parse_thp("[never]"), "never")
+        p = hw.parse_probe("pcie 0 25.3\npcie 1 -1.0\np2p 0 1 0\np2p 1 0 1\nram_read 104.6 48 1\nnoise\n")
+        self.assertEqual((p.pcie_gbps, p.p2p, p.ram_gbps, p.ram_threads), ({0: 25.3, 1: -1.0}, {(1, 0)}, 104.6, 48))
+        gpus, driver = hw.parse_nvidia_smi("0, NVIDIA GeForce RTX 3090, 24576, 8.6, 4, 16, 580.82, 8\n")
+        self.assertEqual((gpus[0].pcie_width, gpus[0].pcie_width_now, driver), (16, 8, "580.82"))
+        self.assertGreater(hw.free_gib(Path("/nonexistent/sub/dir")), 0)
+
+
 # ---------------------------------------------------------------------------------------------------- proposal
 def machine(gpus=2, vram=24576, ram=450, threads=48, sm="8.6"):
     cards = [hw.GPU(i, "RTX", vram, sm, 4, 16) for i in range(gpus)]
@@ -146,14 +157,71 @@ class PlanTest(unittest.TestCase):
     def test_single_12gb_card_on_a_desktop(self):
         s = plan.propose(fake_model(), machine(gpus=1, vram=12288, ram=192, threads=16), []).settings
         self.assertEqual((s["gpu"], s["layer_split"], s["batch2_cells"]), ([0], "", 0))
-        self.assertEqual(s["max_context"], 131072)  # 7 GiB free: a 128K KV cache (1.68 GiB) is just under a quarter
         self.assertEqual(s["pcie_frac"], "")
         self.assertEqual(s["ple_io"], "ram")        # 192 - 100 - 24 = 68 GiB left, the table takes 28
-        small = plan.propose(fake_model(), machine(gpus=1, vram=11264, ram=192, threads=16), []).settings
+        # 40 GiB left: KV streaming puts the whole 262K KV cache (3.4 GiB) in RAM, so VRAM no longer bounds it
+        self.assertEqual((s["max_context"], s["kv_resident"]), (262000, plan.KV_RESIDENT_CELLS))
+        # no RAM to spare for the KV cache: VRAM bounds the context as before
+        tight = plan.propose(fake_model(ple_gib=1), machine(gpus=1, vram=12288, ram=126, threads=16), []).settings
+        self.assertEqual((tight["max_context"], tight["kv_resident"]), (131072, 0))  # 7 GiB free: 1.68 GiB < 1/4
+        small = plan.propose(fake_model(ple_gib=1), machine(gpus=1, vram=11264, ram=126, threads=16), []).settings
         self.assertEqual(small["max_context"], 65536)  # 6 GiB free: 128K's 1.68 GiB is over a quarter
 
-    def test_short_of_ram_or_gpu_or_kernels_blocks(self):
+    def test_batch2_keeps_the_kv_cache_in_vram(self):
+        p = plan.propose(fake_model(), machine(), [])
+        self.assertEqual((p.settings["batch2_cells"], p.settings["kv_resident"]), (65536, 0))
+        self.assertIn("Batch-2", dict((k, w) for k, _, w in p.reasons)["kv_resident"])
+
+    def test_experts_past_the_ram_take_the_budget_mode_on_one_card(self):
         p = plan.propose(fake_model(expert_gib=100), machine(ram=96), [])
+        s = p.settings
+        self.assertEqual(p.problems, [])
+        self.assertEqual((s["resident_budget_gib"], s["gpu"], s["layer_split"]), (72, [0], ""))
+        self.assertEqual((s["batch2_cells"], s["conversation_cache_mib"], s["ple_io"]), (0, 0, ""))
+        self.assertTrue(any("do not fit in RAM" in n for n in p.notes))
+        self.assertTrue(any("RAM" in x for x in plan.propose(fake_model(), machine(ram=40), []).problems))
+
+    def test_skip_the_split_when_the_first_card_holds_every_expert(self):
+        self.assertTrue(plan.propose(fake_model(expert_gib=15), machine(), []).settings["split_skip_if_fits"])
+        self.assertFalse(plan.propose(fake_model(), machine(), []).settings["split_skip_if_fits"])
+        self.assertFalse(plan.propose(fake_model(expert_gib=5), machine(gpus=1), []).settings["split_skip_if_fits"])
+
+    def test_an_api_key_once_others_can_reach_it(self):
+        self.assertEqual(plan.propose(fake_model(), machine(), []).settings["api_key"], "")
+        s = plan.propose(fake_model(), machine(), [], host="0.0.0.0", api_key="k1").settings
+        self.assertEqual((s["host"], s["api_key"]), ("0.0.0.0", "k1"))
+        self.assertGreaterEqual(len(plan.propose(fake_model(), machine(), [], host="0.0.0.0").settings["api_key"]), 24)
+
+    def test_measured_bandwidth_sets_the_pcie_share(self):
+        desk = machine(gpus=1, vram=12288, ram=192, threads=16)
+        fast_ram = hw.Probe({0: 25.0}, set(), 100.0, 16)
+        slow_link = hw.Probe({0: 1.5}, set(), 40.0, 16)
+        normal = hw.Probe({0: 25.0}, set(), 45.0, 16)
+        self.assertEqual(plan.propose(fake_model(), desk, [], probe=fast_ram).settings["pcie_frac"], 0)
+        self.assertEqual(plan.propose(fake_model(), desk, [], probe=slow_link).settings["pcie_frac"], 0)
+        self.assertEqual(plan.propose(fake_model(), desk, [], probe=normal).settings["pcie_frac"], "")
+        # measured slow RAM overrides the thread count's guess
+        self.assertEqual(plan.propose(fake_model(), machine(), [], probe=hw.Probe({0: 25, 1: 25}, set(), 45.0, 48))
+                         .settings["pcie_frac"], "")
+
+    def test_system_notes(self):
+        h = machine()
+        h.thp, h.memlock_gib = "never", 8.0
+        h.gpus[1].pcie_width_now = 8
+        notes = " | ".join(plan.propose(fake_model(), h, []).notes)
+        self.assertIn("transparent huge pages are off", notes)
+        self.assertIn("ulimit -l unlimited", notes)
+        self.assertIn("GPU 1 runs at PCIe x8", notes)
+        self.assertEqual(plan.propose(fake_model(), machine(), []).notes, [])
+
+    def test_every_reference_model_has_a_plan(self):
+        for ref in plan.REFERENCE_MODELS:
+            p = plan.propose(ref, machine(), [])
+            self.assertEqual(p.problems, [], ref.name)
+            self.assertEqual([r[0] for r in p.reasons], list(p.settings), ref.name)
+
+    def test_short_of_ram_or_gpu_or_kernels_blocks(self):
+        p = plan.propose(fake_model(expert_gib=100), machine(ram=40), [])
         self.assertTrue(any("RAM" in x for x in p.problems))
         p = plan.propose(fake_model(), machine(sm="6.1"), [])
         self.assertTrue(any("no usable NVIDIA GPU" in x for x in p.problems))
@@ -188,6 +256,29 @@ class CliTest(unittest.TestCase):
             strata_install.parse_args(["--gguf", "m.gguf", "--name", "a/b"])
         a = strata_install.parse_args(["--gguf", "m.gguf", "--set", "kv=int8", "--yes", "--cuda-arch", "86,89"])
         self.assertEqual((a.overrides, a.yes, a.cuda_arch), (["kv=int8"], True, "86,89"))
+        self.assertTrue(strata_install.parse_args(["--system-check"]).system_check)
+        self.assertEqual(strata_install.parse_args(["--system-check", "--set", "max_context=65536"]).overrides,
+                         ["max_context=65536"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            strata_install.parse_args(["--system-check", "--check", "--gguf", "m.gguf"])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            strata_install.parse_args(["--set", "kv=int8"])                       # needs --gguf or --system-check
+
+    def test_bool_overrides(self):
+        s = plan.propose(fake_model(), machine(), []).settings
+        self.assertTrue(strata_install.apply_overrides(s, ["split_skip_if_fits=yes"])["split_skip_if_fits"])
+        with self.assertRaisesRegex(ValueError, "not a valid value"):
+            strata_install.apply_overrides(s, ["split_skip_if_fits=maybe"])
+
+    def test_system_check_without_a_model_prints_every_reference(self):
+        a = strata_install.parse_args(["--system-check"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            strata_install.show_reference(machine(), None, a)
+        text = out.getvalue()
+        for ref in plan.REFERENCE_MODELS:
+            self.assertIn(ref.name, text)
+        self.assertIn("pcie_frac", text)
 
     def test_engine_config_has_everything_and_no_environment(self):
         m = fake_model()
@@ -203,8 +294,23 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("env", cfg)
         s1 = plan.propose(m, machine(gpus=1, vram=12288, ram=130, threads=8), []).settings
         args1 = steps.engine_config(m, s1, Path("/p"), Path("/r"), "M", Path("/l"))["args"]
-        for flag in ("--pcie-frac", "--ple-io", "--batch2-cells", "--conversation-cache-mib"):
+        for flag in ("--pcie-frac", "--ple-io", "--batch2-cells", "--conversation-cache-mib", "--resident-budget-gib"):
             self.assertNotIn(flag, args1)
+        self.assertNotIn("api_key", cfg)
+        self.assertNotIn("split_skip_if_fits", cfg)
+
+    def test_engine_config_carries_the_opt_in_features(self):
+        m = fake_model()
+        kv = plan.propose(m, machine(gpus=1, vram=12288, ram=192, threads=16), []).settings
+        args = steps.engine_config(m, kv, Path("/p"), Path("/r"), "M", Path("/l"))["args"]
+        self.assertEqual(args[args.index("--kv-resident") + 1], str(plan.KV_RESIDENT_CELLS))
+        budget = plan.propose(m, machine(ram=96), []).settings
+        args = steps.engine_config(m, budget, Path("/p"), Path("/r"), "M", Path("/l"))["args"]
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "72")
+        small = fake_model(expert_gib=15)
+        open_s = plan.propose(small, machine(), [], host="0.0.0.0", api_key="k1").settings
+        cfg = steps.engine_config(small, open_s, Path("/p"), Path("/r"), "M", Path("/l"))
+        self.assertEqual((cfg["split_skip_if_fits"], cfg["api_key"]), (True, "k1"))
 
 
 if __name__ == "__main__":
