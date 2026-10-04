@@ -11,9 +11,15 @@ endif()
 # report ran it (#311), the maintainers have not.
 set(_strata_hip_validated gfx1100 gfx1201)
 set(_strata_hip_community gfx1101 gfx1200)
-set(_strata_hip_unvalidated gfx1102 gfx1030)
+set(_strata_hip_unvalidated gfx1012 gfx1102 gfx1030 gfx1031)
+# CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
+# spaces, which foreach(IN LISTS) would otherwise treat as one element.
+string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
 set(STRATA_HIP_ARCH_LIST "")
-foreach(_arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+foreach(_arch IN LISTS _strata_hip_norm)
+  if(_arch STREQUAL "")
+    continue()
+  endif()
   string(REGEX REPLACE ":.*$" "" _base "${_arch}")      # gfx1100:xnack- -> gfx1100
   if(_base IN_LIST _strata_hip_validated)
   elseif(_base IN_LIST _strata_hip_community)
@@ -38,6 +44,13 @@ string(REPLACE ";" "," STRATA_HIP_ARCHS "${STRATA_HIP_ARCH_LIST}")
 enable_language(HIP)
 find_package(hip CONFIG REQUIRED)
 find_package(hipblas CONFIG REQUIRED)
+# Older distro hipBLAS has no workspace API. The compatibility shim uses
+# rocBLAS directly for that version; newer hipBLAS keeps its existing path.
+set(STRATA_HIP_BLAS_TARGETS roc::hipblas)
+if(hipblas_VERSION VERSION_LESS "1.0")
+  find_package(rocblas CONFIG REQUIRED)
+  list(APPEND STRATA_HIP_BLAS_TARGETS roc::rocblas)
+endif()
 find_package(hipblaslt CONFIG QUIET)
 
 if(NOT TARGET hip::host)
@@ -61,12 +74,24 @@ add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
+option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on gfx1012" OFF)
+if(STRATA_GFX1012_PORTABLE_DOT)
+  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_GFX1012_PORTABLE_DOT=1)
+endif()
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
-foreach(_language IN ITEMS CXX HIP)
+# The shim renames the CUDA runtime to HIP, force-included into every host and device source. On Windows the host
+# compiler is ROCm's clang++ too (tools/hip/build_windows.bat: CMake refuses to mix cl.exe with Clang HIP), which takes
+# -include like it does on Linux; an MSVC-style front end (cl / clang-cl) takes /FI instead. Forward slashes, so /FI
+# does not read the path's backslashes as escapes.
+file(TO_CMAKE_PATH "${STRATA_HIP_COMPAT_INCLUDE_DIR}/cuda_runtime.h" _strata_hip_force)
+if(MSVC)
+  target_compile_options(strata_hip_runtime INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:/FI${_strata_hip_force}>")
+else()
   target_compile_options(strata_hip_runtime INTERFACE
-    "$<$<COMPILE_LANGUAGE:${_language}>:-include>"
-    "$<$<COMPILE_LANGUAGE:${_language}>:${STRATA_HIP_COMPAT_INCLUDE_DIR}/cuda_runtime.h>")
-endforeach()
+    "$<$<COMPILE_LANGUAGE:CXX>:-include>" "$<$<COMPILE_LANGUAGE:CXX>:${_strata_hip_force}>")
+endif()
+target_compile_options(strata_hip_runtime INTERFACE
+  "$<$<COMPILE_LANGUAGE:HIP>:-include>" "$<$<COMPILE_LANGUAGE:HIP>:${_strata_hip_force}>")
 
 # CMake does not infer HIP from Strata's existing CUDA-shaped .cu suffixes.
 file(GLOB_RECURSE _strata_hip_sources CONFIGURE_DEPENDS

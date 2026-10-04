@@ -14,9 +14,6 @@
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
-#include <algorithm>
-#include <atomic>
-#include <thread>
 #include <vector>
 #include <stdexcept>
 
@@ -143,8 +140,6 @@ struct PleTable::Impl {
     const uint8_t* data = nullptr;
     uint64_t n_rows = 0;
     bool q5_0 = false;                // #296: Q5_0 rows (110 B), the mapped reader only
-    bool q5_1 = false;                // Q5_1 rows (120 B: Qwen3.8-Flash-Next-Uncensored-Q5_K_M), the mapped reader only
-    bool q8_0 = false;                // Q8_0 rows (170 B: unsloth's GGUFs, Swift-1.5), the mapped reader only
     mutable uint64_t bytes_read = 0;
     // Direct mode (plan v0.3 P2): the mapping above is released after the header parse and every row comes
     // from an unbuffered SSD read into `raw`.
@@ -155,6 +150,11 @@ struct PleTable::Impl {
     bool locked = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    static constexpr size_t kMaxPrefetch = 16;
+    size_t n_prefetch = 0;
+    strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
+    uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
+    uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     bool fp8 = false;                 // F8_E4M3 rows (tools/ple_fp8_pack.py); else IQ4_NL
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
@@ -162,10 +162,6 @@ struct PleTable::Impl {
         if (fp8) fp8_e4m3_dequant_row(row, scale, out160);
         else if (q5_0)
             for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_0(row + (size_t) b * 22, out160 + b * 32);
-        else if (q5_1)
-            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q5_1(row + (size_t) b * 24, out160 + b * 32);
-        else if (q8_0)
-            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) strata::dequantize_q8_0(row + (size_t) b * 34, out160 + b * 32);
         else iq4nl_dequant_row(row, out160);
     }
 };
@@ -197,17 +193,11 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    // IQ4_NL (ISTA-DASLab's shard 2, the original's own GGUF), Q5_0 (#296: OrcaRouter's GGUF), Q5_1 (the Q5_K_M of
-    // the Uncensored finetune), Q8_0 (unsloth's GGUFs, Swift-1.5), or the FP8 table as shipped: I8 bytes marked
-    // strata.ple.format = f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
+    // IQ4_NL (ISTA-DASLab's shard 2, the original's own GGUF), Q5_0 (#296: OrcaRouter's GGUF), or the FP8 table as
+    // shipped: I8 bytes marked strata.ple.format = f8_e4m3 with strata.ple.scale (tools/ple_fp8_pack.py)
     impl_->fp8 = false;
     impl_->q5_0 = std::strcmp(t->type_name(), "Q5_0") == 0;
-    impl_->q5_1 = std::strcmp(t->type_name(), "Q5_1") == 0;
-    impl_->q8_0 = std::strcmp(t->type_name(), "Q8_0") == 0;
-    impl_->rb = impl_->q5_0   ? (PLE_HEAD_DIM / 32) * 22
-                : impl_->q5_1 ? (PLE_HEAD_DIM / 32) * 24
-                : impl_->q8_0 ? PLE_ROW_BYTES_Q8
-                              : PLE_ROW_BYTES;
+    impl_->rb = impl_->q5_0 ? (PLE_HEAD_DIM / 32) * 22 : PLE_ROW_BYTES;
     if (std::strcmp(t->type_name(), "I8") == 0) {
         const MetaValue* f = impl_->file->get("strata.ple.format");
         const MetaValue* s = impl_->file->get("strata.ple.scale");
@@ -219,21 +209,14 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->fp8 = true;
         impl_->scale = (float) s->num();
         impl_->rb = PLE_ROW_BYTES_FP8;
-    } else if (!impl_->q5_0 && !impl_->q5_1 && !impl_->q8_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
-        err = std::string("per_layer_token_embd.weight is ") + t->type_name() +
-              ", not IQ4_NL, Q5_0, Q5_1, Q8_0 or FP8 (I8)";
+    } else if (!impl_->q5_0 && std::strcmp(t->type_name(), "IQ4_NL") != 0) {
+        err = std::string("per_layer_token_embd.weight is ") + t->type_name() + ", not IQ4_NL, Q5_0 or FP8 (I8)";
         close();
         return false;
     }
-    // The direct reader is kept for IQ4_NL; Q5_0's 110-byte, Q5_1's 120-byte and Q8_0's 170-byte rows are read
-    // through the mapping (--ple-io ram: the mapping locked in memory), and a table in one of them asked for direct
-    // reads gets mmap.
-    PleIo mode = io.mode;
-    if ((impl_->q5_0 || impl_->q5_1 || impl_->q8_0) && mode == PleIo::Direct) {
-        std::fprintf(stderr, "strata: PLE table is %s; reading it through mmap (direct reads are IQ4_NL-only)\n",
-                     impl_->q5_0 ? "Q5_0" : impl_->q5_1 ? "Q5_1" : "Q8_0");
-        mode = PleIo::Mmap;
-    }
+    // PleReader's row_bytes has been a runtime parameter since the FP8 table (160 B rows) needed it; Q5_0's
+    // 110 B rows go through the exact same generic path (ple_reader_test --selftest covers both 90 and 110 B
+    // rows: straddling, caching, in-flight tickets, keep-alive). This refusal was stale.
     impl_->n_rows = t->shape[1];
     impl_->data = impl_->file->tensor_data(*t);
 
@@ -260,7 +243,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         close();
         return false;
     }
-    if (mode == PleIo::Direct) {
+    if (io.mode == PleIo::Direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
         const uint64_t table_offset = impl_->file->data_start() + t->offset;
@@ -276,44 +259,61 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         impl_->reader.set_keepalive(io.keepalive_ms, io.keepalive_window_s);
         impl_->n_rows = n_rows;
     }
-    if (mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
+    if (io.mode == PleIo::Mmap && io.lock && impl_->data != nullptr) {
 #if !defined(_WIN32)
         const uint64_t page = 4096;
         const uintptr_t a0 = (uintptr_t) impl_->data & ~(uintptr_t) (page - 1);
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
         madvise((void*) a0, a1 - a0, MADV_WILLNEED);
-        // Fault the table in with several threads first: mlock (and a single toucher) brings it in one page at a time
-        // from one thread, ~0.5 GB/s from a cold file - 106 s for a 54 GB Q8_0 table.  The pages are then resident
-        // and mlock only pins them.
-        {
-            constexpr uintptr_t kPiece = 64ull << 20;
-            const uintptr_t pieces = (a1 - a0 + kPiece - 1) / kPiece;
-            const unsigned threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-            std::atomic<uintptr_t> next{0};
-            auto touch = [&] {
-                volatile uint8_t sink = 0;
-                for (uintptr_t i; (i = next.fetch_add(1)) < pieces;)
-                    for (uintptr_t p = a0 + i * kPiece, e = std::min(a1, p + kPiece); p < e; p += page)
-                        sink = sink + *(const volatile uint8_t*) p;
-                (void) sink;
-            };
-            std::vector<std::thread> pool;
-            for (unsigned t = 0; t < threads; ++t) pool.emplace_back(touch);
-            for (auto& t : pool) t.join();
-        }
         if (mlock((const void*) a0, a1 - a0) == 0) {
             impl_->locked = true;
         } else {
-            std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
-                                 "but may be reclaimed\n", std::strerror(errno));
+            std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): touching its pages instead\n",
+                         std::strerror(errno));
+            volatile uint8_t sink = 0;
+            for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
+            (void) sink;
         }
 #endif
     }
-    impl_->mode = mode;
+    impl_->mode = io.mode;
     return true;
 }
 
+void PleTable::wait_prefetches() {
+    if (impl_->n_prefetch == 0) return;
+    std::string dummy;
+    for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
+    impl_->n_prefetch = 0;
+}
+
+void PleTable::prefetch_rows(const uint32_t* rows16) {
+    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
+        for (size_t i = 0; i < impl_->n_prefetch; ++i)
+            if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
+        if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
+        const size_t slot = impl_->n_prefetch++;
+        std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
+        impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
+        return;
+    }
+#if defined(_WIN32)
+    if (impl_->data != nullptr && g_ple_prefetch) {
+        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
+        ULONG_PTR n = 0;
+        for (int h = 0; h < PLE_N_HEADS; ++h) {
+            if (rows16[h] >= impl_->n_rows) continue;
+            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
+            ranges[n].NumberOfBytes = impl_->rb;
+            ++n;
+        }
+        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
+    }
+#endif
+}
+
 void PleTable::close() {
+    wait_prefetches();
     impl_->reader.close();
     impl_->pending = false;
     impl_->locked = false;   // the unmap below releases the lock
@@ -324,16 +324,12 @@ void PleTable::close() {
     impl_->n_rows = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->q5_0 = false;
-    impl_->q5_1 = false;
-    impl_->q8_0 = false;
     impl_->fp8 = false;
 }
 
 bool PleTable::is_open() const { return impl_->data != nullptr || impl_->reader.is_open(); }
 bool PleTable::locked() const { return impl_->locked; }
-const char* PleTable::format() const {
-    return impl_->fp8 ? "F8_E4M3" : impl_->q5_0 ? "Q5_0" : impl_->q5_1 ? "Q5_1" : impl_->q8_0 ? "Q8_0" : "IQ4_NL";
-}
+const char* PleTable::format() const { return impl_->fp8 ? "F8_E4M3" : impl_->q5_0 ? "Q5_0" : "IQ4_NL"; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
@@ -360,6 +356,7 @@ void PleTable::read_row(uint32_t row, float* out160) const {
 }
 
 bool PleTable::issue(const uint32_t* rows16) {
+    wait_prefetches();
     std::memcpy(impl_->rows, rows16, sizeof impl_->rows);
     if (impl_->mode == PleIo::Direct) {
         if (impl_->pending) return false;              // one token in flight per table
@@ -402,6 +399,35 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
     if (impl_->mode == PleIo::Direct) {
+        // Fast path: if all requested tokens match our in-flight/completed prefetch slots, collect them directly
+        // without issuing a second PleReader ticket or copying through RowCache.
+        if (impl_->n_prefetch >= n_tokens && n_tokens <= Impl::kMaxPrefetch) {
+            bool exact_match = true;
+            for (size_t t = 0; t < n_tokens; ++t) {
+                if (std::memcmp(impl_->prefetch_keys[t], rows + t * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS) != 0) {
+                    exact_match = false;
+                    break;
+                }
+            }
+            if (exact_match) {
+                for (size_t i = 0; i < impl_->n_prefetch; ++i) {
+                    if (!impl_->reader.collect(impl_->prefetch_tickets[i], err)) {
+                        impl_->n_prefetch = 0;
+                        return false;
+                    }
+                }
+                impl_->n_prefetch = 0;
+                for (size_t t = 0; t < n_tokens; ++t) {
+                    for (int h = 0; h < PLE_N_HEADS; ++h) {
+                        impl_->decode(impl_->prefetch_raw[t] + (size_t) h * impl_->rb,
+                                      out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
+                    }
+                }
+                impl_->bytes_read += (uint64_t) n * impl_->rb;
+                return true;
+            }
+        }
+        wait_prefetches();
         std::vector<uint8_t> raw(n * impl_->rb);
         const auto ticket = impl_->reader.issue(rows, n, raw.data());
         if (!impl_->reader.collect(ticket, err)) return false;
@@ -409,6 +435,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         impl_->bytes_read += (uint64_t) n * impl_->rb;
         return true;
     }
+    wait_prefetches();
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
 }

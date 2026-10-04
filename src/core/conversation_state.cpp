@@ -219,23 +219,18 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     return true;
 }
 
-bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss,
-                                 const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error) {
-    return conversation_snapshot_bytes(view, ss, g, &draft, bytes, error);
-}
-
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& ss, const ModelGeometry& g,
-                                         const QsaState& draft, size_t& bytes, std::string& error) {
+                                         const QsaState* draft, size_t& bytes, std::string& error) {
     if (!conversation_snapshot_bytes(view, ss, g, draft, bytes, error)) return false;
     if (reuse.kv.empty()) return true;
-    const size_t layers = owned_qsa(ss) + 1;
+    const size_t layers = owned_qsa(ss) + (draft ? 1 : 0);
     if (reuse.kv.size() != layers || reuse.unchanged_tokens < 0 ||
         reuse.unchanged_tokens > reuse.captured_tokens || reuse.unchanged_tokens > int64_t(view.ids.size()))
         return fail(error, "invalid retained K/V prefix");
     for (size_t i = 0; i < layers; ++i) {
-        const bool index = i + 1 != layers;
-        const auto& st = index ? owned(ss, i) : draft;
+        const bool index = i < owned_qsa(ss);
+        const auto& st = index ? owned(ss, i) : *draft;
         if (!conversation_kv_validate(reuse.kv[i], st, g, reuse.captured_tokens, index, error)) return false;
         const size_t fresh = conversation_kv_bytes(st, g, int64_t(view.ids.size()), index);
         size_t retained = 0;
@@ -249,14 +244,12 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
     return true;
 }
 
-namespace {
-bool snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
-                   const ModelGeometry& g, const QsaState* draft, std::string& error, ConversationKvReuse reuse,
-                   size_t* reused_bytes) {
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                const SessionState& ss, const ModelGeometry& g,
+                                const QsaState* draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes) {
     size_t estimate = 0;
-    const bool counted = draft ? conversation_snapshot_capture_bytes(reuse, view, ss, g, *draft, estimate, error)
-                               : conversation_snapshot_bytes(view, ss, g, nullptr, estimate, error);
-    if (!counted || !sync(error)) return false;
+    if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -279,24 +272,11 @@ bool snapshot_save(SavedConversation& image, const ConversationView& view, const
     image = std::move(captured);
     return true;
 }
-} // namespace
-
-bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
-                                const SessionState& ss, const ModelGeometry& g,
-                                const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
-    return snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes);
-}
-
-bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
-                                const SessionState& ss, const ModelGeometry& g,
-                                const QsaState* draft, std::string& error) {
-    return snapshot_save(image, view, ss, g, draft, error, {}, nullptr);
-}
 
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
-    if (!image.live.stage_parts.empty()) return fail(error, "a checkpoint's stage parts belong to stage_parts");
+    if (!image.live.stage_parts.empty())
+        return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
     // an image holds exactly one carve's running state and K/V: same layer range or nothing
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
@@ -309,12 +289,6 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
-}
-
-bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
-                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
-    if (!image.stage_parts.empty()) return fail(error, "a layer split's image restores per stage");
-    return conversation_snapshot_validate(image, ss, g, &draft, error);
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
@@ -330,12 +304,29 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     return ConversationRestore::restored;
 }
 
+// the draft layer's K/V included (the stage that owns the draft head, or no layer split)
+bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                 const QsaState& draft, size_t& bytes, std::string& error) {
+    return conversation_snapshot_bytes(view, ss, g, &draft, bytes, error);
+}
+bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
+                                         const SessionState& ss, const ModelGeometry& g, const QsaState& draft,
+                                         size_t& bytes, std::string& error) {
+    return conversation_snapshot_capture_bytes(reuse, view, ss, g, &draft, bytes, error);
+}
+bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
+                                const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                ConversationKvReuse reuse, size_t* reused_bytes) {
+    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes);
+}
+bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                                    const QsaState& draft, std::string& error) {
+    // the whole-session form: a layer split's image (stage images) is restored stage by stage, never through here
+    if (!image.stage_images.empty()) return fail(error, "a layer split's image restored as a single session");
+    return conversation_snapshot_validate(image, ss, g, &draft, error);
+}
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
-    if (!image.stage_parts.empty()) {
-        error = "a layer split's image restores per stage";
-        return ConversationRestore::invalid;
-    }
     return conversation_snapshot_restore(image, ss, g, &draft, error);
 }
 } // namespace strata::core
