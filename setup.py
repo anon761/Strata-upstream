@@ -1126,16 +1126,16 @@ def find_vcvars():
 
 
 def find_tool(name):
-    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja)."""
-    p = shutil.which(name)
-    if p:
-        return p
+    """The one pip installed next to this Python (cmake, ninja), else the one on PATH.
+
+    The pip-installed copy comes first on purpose: setup pins and installs it, while a
+    distro's older cmake on PATH cannot configure the CUDA 20 dialect and fails the build."""
     for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent,
               Path.home() / ".local" / "bin"):
         c = d / (name + (".exe" if WIN else ""))
         if c.exists():
             return str(c)
-    return None
+    return shutil.which(name)
 
 
 def free_gb(path):

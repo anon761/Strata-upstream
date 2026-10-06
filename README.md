@@ -1,4 +1,157 @@
-<h1 align="center">Strata</h1>
+# arcfork-strata
+
+> **A fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)** (MIT), merged with upstream `v0.1.32`.
+> This fork is not affiliated with or endorsed by the Strata authors. Upstream's README is kept verbatim at the
+> bottom; the engine, its design and its documentation are upstream's work.
+
+## What this is
+
+`arcfork-strata` is an internal fork of the **Strata** inference engine. Strata upstream is a specialised,
+high-performance engine for *one* model family - **Qwen3.8-Flash-Next** - originally through ISTA-DASLab's
+**GSQ-RCO** i-quant packs, and since v0.1.31 also through ordinary GGUFs such as unsloth's `UD-Q4_K_XL`.
+
+The fork runs those ordinary GGUFs - unsloth's `UD-Q4_K_XL` and finetunes such as **Swift-1.5 Q4_K_L** - on a
+**2x RTX 3090** box with a **262K context** for coding agents, and adds what that setup needs on top of upstream.
+It is driven from `mayaservices` as the GGUF backend, next to stock vLLM for safetensors models.
+
+## What the fork adds on top of upstream
+
+- **Conversation parking with a layer split.** Upstream's conversation cache (`--conversation-cache-mib`) parks
+  whole conversations in RAM but refused `--layer-split`. Here every stage parks its own part (running state,
+  checkpoint states, K/V of its layers; the draft layer's with the last stage) and restores it on its own GPU,
+  so clients that take turns (an agent, the web chat, the Matrix bot) no longer re-read each other's context.
+  Validated with upstream's `tools/conversation_cache_parity.py` (A/B/A byte-exact state, pressure fallback).
+- **The idle GPU helps short prompts.** A prompt that fits one chunk runs the split's stages one after the
+  other; the idle stage's GPU streams and computes part of the active stage's experts over its own PCIe link
+  (deterministic, `STRATA_PREFILL_HELP=0` turns it off): 2K-token prompts +28-34%.
+- **Follow-ups resume their session.** A verify window commits only the tokens it hands out (an answer that
+  ended inside an accepted draft left the session ahead of the client), and the server keeps the recent requests'
+  own token ids, since a model's sampled tokens are not always the tokenizer's split of the same text.
+- **Q5_0 down experts on the GPU** (Swift-1.5 Q4_K_L, OrcaRouter Q4_K_S) and a **Q8_0 PLE table** (unsloth,
+  Swift-1.5).
+- The expert arena on **transparent huge pages** (Linux, THP `madvise`).
+- Tools: `iq_pack.py` prints `IQPACK_PROGRESS` lines (mayaservices' progress bar); `mtp_fetch.py --repo` fetches
+  the MTP head from a finetune's own BF16 checkpoint.
+- `setup.py` prefers the pip-installed `cmake`/`ninja` (a distro cmake is too old for the CUDA 20 dialect).
+
+Earlier fork work that upstream now has in its own form (and that the fork follows): ordinary GGUF experts
+(Q4_K/Q5_K/Q5_1/Q8_0) with MMQ, per-role expert shards, `--ple-io ram`, the prompt loans of a layer split.
+
+## Measured results
+
+2x **RTX 3090** (24 GB each), AMD EPYC 7413, **450 GB** RAM, driver 580, CUDA 13.3, layer split across both cards,
+**262K context**, MTP speculative decoding on (`--spec 4`), `--pcie-frac 0 --ple-io ram`, conversation parking on.
+Single request, OpenAI `/v1/chat/completions`, a coding workload: prompts of real C++/CUDA source, a code-writing
+task for decode (768 tokens, greedy), and a follow-up turn on an 8K conversation (time to first token, the prefix
+reused). Decode excludes time-to-first-token and includes the accepted drafts, so it varies with the text.
+
+| Engine, model | Prefill 2K | 8K | 32K | Decode tok/s | Follow-up turn |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **this fork, unsloth `UD-Q4_K_XL`** (103.7 GiB) | **~1,010** | **~1,860** | **~3,260** | **~116** | **~0.17 s** |
+| **this fork, `Swift-1.5 Q4_K_L`** | ~1,020 | ~1,830 | ~3,210 | ~117 | ~0.22 s |
+| FreeToken, `Swift-1.5 NVFP4` (tensor parallel over both cards) | ~1,280 | ~1,450 | ~1,630 | ~104 | ~1.1 s |
+| the fork on v0.1.28 before this work, `UD-Q4_K_XL` | ~650 | ~1,170 | ~1,370 | ~71 | ~0.4 s |
+
+Two 8K coding conversations taking turns (A, B, A, B, ...): a follow-up's time to first token **~4.6 s without
+parking, ~0.63 s with it** (the other conversation's context is restored instead of read again). Needle-in-a-
+haystack recall 12/12 at 2K/32K/128K/250K.
+
+`--pcie-frac 0` (an expert-cache miss is computed by the CPU pool instead of fetched over PCIe) suits a CPU with
+many cores and memory channels (here 24 cores, ~105 GB/s); on a desktop CPU keep the default.
+
+## Installing
+
+On a bare **Debian 12 or 13** (amd64) the installer sets up everything - system packages, the NVIDIA driver and
+CUDA toolkit 13.3 from NVIDIA's Debian repository, the Python environment, and the engine built from this fork for
+the GPUs it finds. No environment variables are needed.
+
+```bash
+git clone <this fork> && cd arcfork-strata
+sudo ./install.sh                                    # install; reboots once if it had to install the driver
+sudo ./install.sh --gguf /models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+```
+
+With `--gguf` it checks the model (architecture, every layer's expert types against the engine's GPU kernels, RAM
+for the expert arena), shows the settings it proposes for this hardware with a reason for each - GPUs and layer
+split, context length, the n-gram table in RAM, `--pcie-frac`, conversation parking, Batch-2 - and after you
+confirm builds the pack and the MTP draft head next to the model and writes `configs/<name>.json` and
+`run-<name>.sh`. Features that only work once switched on are proposed where they fit: KV streaming
+(`--kv-resident`, from 64K context when RAM holds the KV cache; not with Batch-2), the RAM-budget mode
+(`--resident-budget-gib`, one GPU) when the experts do not fit in RAM instead of refusing the model, skipping the
+split when the first card holds every expert, and an API key once `--host` is not local. It also notes what the
+system has to allow: transparent huge pages off, a memlock limit below the experts, a GPU in a narrower slot.
+
+`./install.sh --system-check` (no root, changes nothing) checks this machine - driver, transparent huge pages,
+memlock, free disk, GPUs and their links, CPU, RAM - offers to measure every GPU's PCIe bandwidth, P2P and the RAM's
+read bandwidth (y/n; stop a running engine first, it holds the GPUs' memory) and prints the best settings: for one
+model with `--gguf`, else for the common quantizations (UD-Q4_K_XL, Swift-1.5 Q4_K_L, Q5_K_M, UD-Q6_K_XL). The
+measurement decides `--pcie-frac`; the engine's `--system-probe` does it. Useful options:
+
+| Option | |
+| --- | --- |
+| `--check` | only show the hardware and the proposal (no root needed, changes nothing) |
+| `--system-check` | check this machine and print its best settings (with `--gguf`: for that model); `--yes` measures without asking |
+| `--set KEY=VALUE` | change a proposed setting, e.g. `--set max_context=131072` (repeatable) |
+| `--yes` | apply without asking |
+| `--service` | also install a systemd service `strata-<name>` that starts at boot |
+| `--port`, `--host`, `--name` | API port (8080), listen address (127.0.0.1), the model name the API reports |
+| `--mtp-repo URL` | the BF16 checkpoint with the MTP head of a fine-tune (default: Qwen's) |
+| `--cuda-arch 86,89` | build for these GPUs instead of the visible ones (a build container without GPUs) |
+
+In a container (LXC, Docker) the driver comes from the host: pass the GPUs in, the installer installs the rest.
+Running it again only does what is missing; a rebuilt engine follows a new checkout. Upstream's own one-click setup
+(`setup.sh` / `START-HERE.bat`) stays for upstream's GSQ-RCO models and ready-made engines, which lack this fork's
+changes.
+
+### By hand
+
+```bash
+git clone <this fork> && cd arcfork-strata
+# a source build for the ordinary GGUFs: the K-quant (and Q5_0) MMQ prompt kernels are build options, off upstream
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+      -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_ORCA_Q4KS_MMQ=ON
+ninja -C build strata
+```
+
+For an **ordinary GGUF** (e.g. unsloth `UD-Q4_K_XL`), prepare a pack and the MTP head and point the server at them
+(`mayaservices`' `strata-run.py` builds a missing pack and MTP head itself):
+
+```bash
+# 1) the native pack (reads every shard; --compat-bf16 dequantizes the small projections)
+.venv/bin/python tools/iq_pack.py --gguf <shard1.gguf> --out /path/to/pack --compat-bf16
+# 2) the MTP head (--repo: the BF16 checkpoint of a finetune, e.g. Swift-1.5's), as setup.py does
+.venv/bin/python tools/mtp_fetch.py fetch --out <mtp dir> [--repo <hf resolve/main url>]
+.venv/bin/python tools/mtp_pack.py --src <mtp dir> --experts q2_0 --out <mtp dir>/mtp-q2_0.gguf
+.venv/bin/python tools/mtp_rt.py --gguf <mtp dir>/mtp-q2_0.gguf --out <mtp dir>/rt && cp data/draft_vocab.bin <mtp dir>/rt/
+# 3) a run config (see serve/server.py --help) with:
+#    --pack <pack> --native <shard1> --native-head-gguf <shard with output.weight> --ple-gguf <shard with PLE>
+#    --expert-profile data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --mtp <mtp dir>/rt
+#    --max-context 262000 --kv int8 --pcie-frac 0 --ple-io ram
+#    --conversation-cache-mib 16384 --conversation-cache-slots 4   and  "gpu": [0,1], "layer_split": "auto"
+```
+
+A pack written by the fork before the merge (`native_experts.txt` with space-separated per-role shards) has to be
+written again with this `iq_pack.py`. `--ple-io ram` needs RAM for the table (IQ4_NL ~28 GB, Q8_0 ~54 GB; a cold
+start reads it in ~1-2 min) on top of the expert arena; parking adds up to its budget.
+
+Requirements are upstream's: an NVIDIA RTX 20+ card, a current driver, and (for a source build) a CUDA toolkit
+with `nvcc` (CUDA 13.x tested). Everything else is set up by `setup.sh`.
+
+## Known issues / limitations
+
+- **Single GPU in an LXC** can fail `cublasCreate` when the expert cache fills VRAM (container pinning limits).
+  The 2-GPU layer split is the supported configuration.
+- Split parking makes a full copy on every park (upstream's retained-K/V reuse is single-GPU only); a 2K-token
+  conversation parks in ~150 ms. `--split-device 0` (the one-GPU check of the hand-off) refuses parking.
+
+## License and attribution
+
+MIT, upstream's [`LICENSE`](LICENSE) unchanged. The engine, the kernels, the MMQ path (llama.cpp, MIT), the model
+and the packs are upstream's and their authors' work - see the upstream README below and `LICENSE`.
+
+---
+
+<h2 align="center">Strata</h2>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
